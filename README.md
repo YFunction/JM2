@@ -15,7 +15,7 @@
 | 项目 | 详情 |
 |------|------|
 | 体验 QQ | **2837430647**（JMBot） |
-| 加群体验 | 983855437 / 376921790 |
+
 | 触发方式 | `@JMBot` 或 `/` 指令 |
 
 ## 功能
@@ -133,7 +133,7 @@ NapCat WebUI 中启用 HTTP 服务（端口 3000）并添加 HTTP 上报到 `htt
 
 ```bash
 cd JM2
-BOT_QQ=2837430647 ALLOWED_GROUPS=983855437,376921790 \
+BOT_QQ=你的QQ号 ALLOWED_GROUPS=群号1,群号2 \
   PYTHONUNBUFFERED=1 nohup python3 -u bot_download_server.py > /tmp/bot.log 2>&1 &
 ```
 

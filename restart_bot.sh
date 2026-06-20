@@ -4,7 +4,7 @@ cd /root/JM2
 
 # 读取当前进程的环境变量
 BOT_QQ="${BOT_QQ:-2837430647}"
-ALLOWED_GROUPS="${ALLOWED_GROUPS:-983855437,376921790}"
+ALLOWED_GROUPS="${ALLOWED_GROUPS:-}"
 
 # 停止
 fuser -k 9001/tcp 2>/dev/null
