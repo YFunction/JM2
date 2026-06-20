@@ -6,11 +6,9 @@
 
 ## ⚠️ 免责声明
 
-<iframe src="//player.bilibili.com/player.html?bvid=BV1Ts4y1F7r3&autoplay=1&page=1" 
-  scrolling="no" border="0" frameborder="no" framespacing="0" allowfullscreen="true"
-  width="100%" height="500"></iframe>
+[![⚠️ 2000字！宇宙安全声明合集](https://img.shields.io/badge/Bilibili-⚠️_宇宙安全声明合集-00A1D6?style=for-the-badge&logo=bilibili&logoColor=white)](https://www.bilibili.com/video/BV1Ts4y1F7r3/)
 
-> 📺 视频：[2000字！宇宙安全声明合集 — 哔哩哔哩](https://www.bilibili.com/video/BV1Ts4y1F7r3/)
+> ⚠️ 使用前请务必观看：[2000字！宇宙安全声明合集](https://www.bilibili.com/video/BV1Ts4y1F7r3/)
 
 ## 🤖 体验 QQ
 
