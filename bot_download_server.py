@@ -46,7 +46,7 @@ def _nlp_parse(text: str):
 
     # 意图匹配（加权）
     _INTENTS = [
-        ("search", [r"查[一下]?", r"搜[索]?", r"找[一下]?", r"有没有", r"看看", r"想看", r"[给来]个"], 1.0),
+        ("search", [r"查[一下]?", r"搜[索]?", r"找[一下个]?", r"有没有", r"看看", r"想看", r"[给来]个"], 1.0),
         ("download", [r"下载", r"下[一个]?", r"来[一]?份", r"要这个"], 1.0),
         ("random", [r"推荐", r"[随来]一个", r"随便", r"有什么好"], 1.0),
         ("top", [r"排行", r"热门", r"最火", r"[日周月]榜"], 1.0),
@@ -84,7 +84,7 @@ def _nlp_parse(text: str):
     # 提取搜索关键词
     query = text
     # 去掉意图词、排序词、语气词
-    noise = r"有没有|帮我|查一下|搜索|找一下|看看|来个|想看|推荐|最新|新出|最近|刚出|收藏|点赞|喜欢|最火|热门|观看|看过|热度|最长|页数|下载|一个|一下|本子|漫画|的|什么"
+    noise = r"有没有|帮我|查一下|搜索|找一下|找个|看看|来个|想看|推荐|最新|新出|最近|刚出|收藏|点赞|喜欢|最火|热门|观看|看过|热度|最长|页数|下载|一个|一下|本子|漫画|的|什么"
     for w in noise.split("|"):
         query = re.sub(w, "", query)
     query = re.sub(r'\s+', ' ', query).strip() or text
@@ -131,10 +131,10 @@ COMMAND_SYSINFO_RE = re.compile(r"/sysinfo", re.IGNORECASE)
 COMMAND_PREFS_RE = re.compile(r"/prefs(?:\s+set\s+sort=(\S+))?(?:\s+top=(\d+))?", re.IGNORECASE)
 COMMAND_COVER_RE = re.compile(r"/cover\s+(\d{6,})", re.IGNORECASE)
 COMMAND_RATING_RE = re.compile(r"/rating\s+(\d{6,})\s+(\d|10)", re.IGNORECASE)
-# 自然语言中的车号: JM350234 或 纯6+位数字
-_CAR_NUMBER_RE = re.compile(r'(?:JM)?(\d{6,})\b')
+# 自然语言中的车号: JM350234 或 纯6-8位数字（排除 QQ 号）
+_CAR_NUMBER_RE = re.compile(r'(?:JM)?(\d{6,8})\b')
 
-# 去除消息开头的 @mention（如 @bot、@JMBot）
+# 去除消息开头的 @mention（如 @bot、@JMBot、@YDH*）
 _AT_RE = re.compile(r'^\s*@\S+\s*')
 
 # 消息自动撤回延迟（秒）
