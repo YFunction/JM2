@@ -10,7 +10,8 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify
+from waitress import serve as wsgi_serve
 
 app = Flask(__name__)
 
@@ -41,6 +42,18 @@ COMMAND_DL_NOSEND_RE = re.compile(r"/download\s+(\d{6,})\b.*?(-s|nosend|--store)
 _DOWNLOADED_LOG = _LOG_DIR / "downloaded.txt"
 # 后台下载间隔（秒）
 _BG_DOWNLOAD_INTERVAL = 30
+# 子进程重试次数
+_SUBPROCESS_RETRIES = 3
+# 频率限制：窗口(秒) / 最大请求数
+_RATE_LIMIT_WINDOW = 10
+_RATE_LIMIT_MAX = 5
+# 群白名单（逗号分隔，空=不限制）
+_ALLOWED_GROUPS = set(
+    g.strip() for g in os.getenv("ALLOWED_GROUPS", "").split(",") if g.strip()
+)
+# 频率限制状态
+_rate_limit_state: dict = {}
+_rate_limit_lock = threading.Lock()
 COMMAND_SE_RE = re.compile(r"/search\s+(.+)", re.IGNORECASE)
 COMMAND_PING_RE = re.compile(r"/ping", re.IGNORECASE)
 COMMAND_HELP_RE = re.compile(r"/help", re.IGNORECASE)
@@ -60,6 +73,44 @@ def log(msg: str) -> None:
 
 def _ensure_log_dir() -> None:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _check_rate_limit(user_id, group_id) -> bool:
+    """Check rate limit, return True if allowed."""
+    key = f"{group_id}:{user_id}"
+    now = time.time()
+    with _rate_limit_lock:
+        if key not in _rate_limit_state:
+            _rate_limit_state[key] = []
+        _rate_limit_state[key] = [t for t in _rate_limit_state[key] if now - t < _RATE_LIMIT_WINDOW]
+        if len(_rate_limit_state[key]) >= _RATE_LIMIT_MAX:
+            return False
+        _rate_limit_state[key].append(now)
+        return True
+
+
+def _check_group_allowed(group_id) -> bool:
+    """Check if group is allowed (empty whitelist = allow all)."""
+    if not _ALLOWED_GROUPS:
+        return True
+    return str(group_id) in _ALLOWED_GROUPS
+
+
+def _run_subprocess_with_retry(cmd: list, timeout: int = 600):
+    """Run subprocess with retry and exponential backoff."""
+    last_err = None
+    for attempt in range(1, _SUBPROCESS_RETRIES + 1):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=timeout)
+        except subprocess.TimeoutExpired as e:
+            last_err = e
+            log(f"subprocess timeout (attempt {attempt}/{_SUBPROCESS_RETRIES})")
+        except Exception as e:
+            last_err = e
+            log(f"subprocess error (attempt {attempt}/{_SUBPROCESS_RETRIES}): {e}")
+        if attempt < _SUBPROCESS_RETRIES:
+            time.sleep(2 ** attempt)
+    raise last_err
 
 
 def log_chat(event: dict[str, Any], text: str) -> None:
@@ -169,11 +220,77 @@ def _background_downloader() -> None:
         time.sleep(60)
 
 
+def _health_monitor() -> None:
+    """后台线程：定期检查 NapCat 连接状态。"""
+    fail_count = 0
+    while True:
+        time.sleep(60)
+        try:
+            resp = send_onebot_api("get_login_info", {})
+            if isinstance(resp, dict) and resp.get("status") == "ok":
+                if fail_count > 0:
+                    log(f"health: NapCat reconnected after {fail_count} failures")
+                fail_count = 0
+            else:
+                fail_count += 1
+                log(f"health: NapCat unhealthy (fail={fail_count})")
+        except Exception as e:
+            fail_count += 1
+            log(f"health: NapCat unreachable (fail={fail_count}): {e}")
+
+
+def _rotate_log_file(filepath: Path, max_size_mb: int = 5, keep: int = 3) -> None:
+    """日志轮转：超 max_size_mb 时重命名为 .1/.2/...，保留 keep 份。"""
+    if not filepath.exists():
+        return
+    size_mb = filepath.stat().st_size / (1024 * 1024)
+    if size_mb < max_size_mb:
+        return
+    # 删除最旧的
+    oldest = filepath.parent / f"{filepath.name}.{keep}"
+    if oldest.exists():
+        oldest.unlink()
+    # 轮转: .2 → .3, .1 → .2, 当前 → .1
+    for i in range(keep - 1, 0, -1):
+        src = filepath.parent / f"{filepath.name}.{i}"
+        dst = filepath.parent / f"{filepath.name}.{i + 1}"
+        if src.exists():
+            src.rename(dst)
+    filepath.rename(filepath.parent / f"{filepath.name}.1")
+
+
+def _disk_cleanup() -> None:
+    """清理旧 PDF（保留最近 50 个）。"""
+    pdfs = sorted(OUTPUT_DIR.glob("[JM*]*.pdf"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for old in pdfs[50:]:
+        try:
+            old.unlink()
+            log(f"cleanup: removed old pdf {old.name}")
+        except Exception as e:
+            log(f"cleanup: failed to remove {old.name}: {e}")
+
+
+def _maintenance_worker() -> None:
+    """后台线程：定期日志轮转 + 磁盘清理。"""
+    while True:
+        time.sleep(3600)  # 每小时
+        try:
+            for logfile in [_USAGE_LOG, _ALBUM_LOG]:
+                _rotate_log_file(logfile)
+            _disk_cleanup()
+        except Exception as e:
+            log(f"maintenance error: {e}")
+
+
 def start_background_downloader() -> None:
-    """启动后台下载线程。"""
+    """启动后台下载线程和健康监控线程。"""
     t = threading.Thread(target=_background_downloader, daemon=True, name="bg-downloader")
     t.start()
-    log("background downloader thread started")
+    t2 = threading.Thread(target=_health_monitor, daemon=True, name="health-monitor")
+    t2.start()
+    t3 = threading.Thread(target=_maintenance_worker, daemon=True, name="maintenance")
+    t3.start()
+    log("background threads started")
 
 
 def log_usage(user_id, group_id, command: str, detail: str = "") -> None:
@@ -457,8 +574,6 @@ def reply_to_event(
         reply_text = f"{text}"
         if file_err:
             reply_text += f"\n⚠️ 文件发送失败: {file_err}"
-        elif file_path is not None and file_path.is_file():
-            reply_text += f"\n📎 文件: http://127.0.0.1:9001/files/{file_path.name}"
     reply_text += RECALL_NOTICE
 
     # Step 3: Send text message and schedule recall
@@ -513,16 +628,13 @@ def run_search(query: str, sort: str = None, top_n: int = None, page: int = None
         cmd += ["-t", search_type]
     log(f"running search: {' '.join(cmd)}")
     try:
-        proc = subprocess.run(cmd, capture_output=True, timeout=45)
-        stdout = proc.stdout.decode("utf-8", errors="replace") if proc.stdout else ""
-        stderr = proc.stderr.decode("utf-8", errors="replace") if proc.stderr else ""
+        proc = _run_subprocess_with_retry(cmd, timeout=45)
+        stdout = proc.stdout or ""
+        stderr = proc.stderr or ""
         log(f"search done: rc={proc.returncode} out={len(stdout)} err={len(stderr)}")
     except subprocess.TimeoutExpired:
-        log("search timed out after 45s")
-        return "查询超时（45秒），请稍后重试。"
-    except FileNotFoundError:
-        log(f"Python not found: {PYTHON_EXE}")
-        return "查询服务未就绪（Python 路径错误）。"
+        log("search timed out after retries")
+        return "查询超时，请稍后重试。"
     except Exception as e:
         log(f"search subprocess exception: {type(e).__name__}: {e}")
         return f"查询异常: {e}"
@@ -547,6 +659,9 @@ def run_search(query: str, sort: str = None, top_n: int = None, page: int = None
 
 
 def run_download(album_id: str, keep_existing: bool = False) -> tuple[str, Path | None]:
+    # 安全检查：album_id 必须是纯数字
+    if not re.fullmatch(r'\d{6,}', album_id):
+        return "❌ 无效的本子 ID", None
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     # 删除旧的 PDF 文件，避免 find_latest_pdf 返回过期结果
     # keep_existing=True 时跳过清理（用于后台批量下载）
@@ -559,7 +674,7 @@ def run_download(album_id: str, keep_existing: bool = False) -> tuple[str, Path 
                 log(f"failed to clean old pdf {old_pdf.name}: {e}")
     cmd = [PYTHON_EXE, str(SCRIPT_PATH), album_id, "-o", str(OUTPUT_DIR)]
     log(f"running: {' '.join(cmd)}")
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=600)
+    proc = _run_subprocess_with_retry(cmd, timeout=600)
     stdout = proc.stdout or ""
     stderr = proc.stderr or ""
     log_output = (stdout + "\n" + stderr).strip()
@@ -610,14 +725,6 @@ def diag():
     return jsonify(result)
 
 
-@app.route("/files/<path:filename>", methods=["GET"])
-def serve_pdf(filename: str):
-    candidate = OUTPUT_DIR / filename
-    if not candidate.is_file():
-        return jsonify({"ok": False, "error": "file not found"}), 404
-    return send_file(candidate, as_attachment=True)
-
-
 @app.route("/onebot", methods=["POST"])
 def onebot_handler():
     try:
@@ -635,14 +742,32 @@ def onebot_handler():
     log(f"message received: type={event_type} text={message_text!r}")
     if not message_text:
         return jsonify({"ok": True})
+    # 输入长度限制（防 DoS）
+    if len(message_text) > 2000:
+        log(f"message too long: {len(message_text)} chars")
+        return jsonify({"ok": True})
 
     # 保存聊天记录（分群/私聊文件）
     log_chat(event, message_text)
+
+    user_id = event.get("user_id")
+    group_id = event.get("group_id")
+
+    # 群白名单检查
+    if group_id and not _check_group_allowed(group_id):
+        log(f"blocked: group {group_id} not in whitelist")
+        return jsonify({"ok": False, "error": "group not allowed"}), 403
 
     msg = message_text.strip()
     # 去除开头的 @mention
     msg = _AT_RE.sub('', msg).strip()
     log(f"msg={msg!r}")
+
+    # 频率限制检查（仅对命令生效）
+    is_command = any(r.search(msg) for r in [COMMAND_PING_RE, COMMAND_JMURL_RE, COMMAND_HELP_RE, COMMAND_SE_RE, COMMAND_DL_RE])
+    if is_command and not _check_rate_limit(user_id, group_id):
+        log(f"rate limited: user={user_id} group={group_id}")
+        return jsonify({"ok": False, "error": "rate limited"}), 429
 
     # /ping - 快速诊断：验证消息回路通畅
     if COMMAND_PING_RE.search(msg):
@@ -754,8 +879,11 @@ if __name__ == "__main__":
     import sys
     print("[bot] Starting...", flush=True)
     start_background_downloader()
+    port = int(os.getenv("PORT", "9001"))
+    threads = int(os.getenv("WORKER_THREADS", "4"))
     try:
-        app.run(host="0.0.0.0", port=int(os.getenv("PORT", "9001")), debug=False)
+        print(f"[bot] waitress serving on 0.0.0.0:{port} (threads={threads})", flush=True)
+        wsgi_serve(app, host="0.0.0.0", port=port, threads=threads)
     except Exception as e:
         print(f"[bot] FATAL: {e}", file=sys.stderr)
         sys.exit(1)

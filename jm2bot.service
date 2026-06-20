@@ -1,0 +1,17 @@
+[Unit]
+Description=JM2 QQ Bot Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/JM2
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/usr/bin/python3 -u /root/JM2/bot_download_server.py
+Restart=always
+RestartSec=10
+StandardOutput=append:/tmp/bot.log
+StandardError=append:/tmp/bot.log
+
+[Install]
+WantedBy=multi-user.target
