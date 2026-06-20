@@ -17,7 +17,7 @@ from waitress import serve as wsgi_serve
 app = Flask(__name__)
 
 SCRIPT_PATH = Path(__file__).resolve().parent / "download_album_to_pdf.py"
-OUTPUT_DIR = Path(os.getenv("DOWNLOAD_OUTPUT_DIR", str((Path(__file__).resolve().parent / "my_pdf_output"))))
+OUTPUT_DIR = Path(os.getenv("DOWNLOAD_OUTPUT_DIR", str((Path(__file__).resolve().parent / "downloads"))))
 PYTHON_EXE = os.getenv("PYTHON_EXE", sys.executable)
 ONEBOT_BASE_URL = os.getenv("ONEBOT_BASE_URL", "http://127.0.0.1:3000")
 ONEBOT_ACCESS_TOKEN = os.getenv("ONEBOT_ACCESS_TOKEN", "")
@@ -84,9 +84,13 @@ def _nlp_parse(text: str):
     # 提取搜索关键词
     query = text
     # 去掉意图词、排序词、语气词
-    noise = r"有没有|帮我|查一下|搜索|找一下|找个|看看|来个|想看|推荐|最新|新出|最近|刚出|收藏|点赞|喜欢|最火|热门|观看|看过|热度|最长|页数|下载|一个|一下|本子|漫画|的|什么"
+    noise = r"有没有|帮我|给我|查一下|搜索|找一下|找个|找|看看|来个|想看|推荐|下载|一个|一下|本子|漫画|的|什么|有|和|了|是|吗|男性|女性|位|生殖器|要用|想找|\([^)]*\)|@\S+"
     for w in noise.split("|"):
         query = re.sub(w, "", query)
+    # 拆分标签为独立关键词
+    query = re.sub(r'([系的子位鬼新])', r'\1 ', query)
+    parts = [p.strip() for p in re.split(r'\s+', query) if len(p.strip()) >= 2 and not p.strip().isdigit()]
+    query = " ".join(parts[:5]) if parts else query
     query = re.sub(r'\s+', ' ', query).strip() or text
 
     return {"intent": best, "album_id": album_id, "query": query,
@@ -104,7 +108,7 @@ COMMAND_DL_NOSEND_RE = re.compile(r"/download\s+(\d{6,})\b.*?(-s|nosend|--store)
 # 已下载记录
 _DOWNLOADED_LOG = _LOG_DIR / "downloaded.txt"
 # 后台下载间隔（秒）
-_BG_DOWNLOAD_INTERVAL = 30
+_BG_DOWNLOAD_INTERVAL = 15
 # 子进程重试次数
 _SUBPROCESS_RETRIES = 3
 # 频率限制：窗口(秒) / 最大请求数
@@ -114,6 +118,9 @@ _RATE_LIMIT_MAX = 5
 _ALLOWED_GROUPS = set(
     g.strip() for g in os.getenv("ALLOWED_GROUPS", "").split(",") if g.strip()
 )
+# 机器人 QQ 号（从环境变量读取，或启动时从 NapCat 获取）
+_BOT_QQ = os.getenv("BOT_QQ", "")
+_BOT_QQ_LOCK = threading.Lock()
 # 频率限制状态
 _rate_limit_state: dict = {}
 _rate_limit_lock = threading.Lock()
@@ -134,8 +141,12 @@ COMMAND_RATING_RE = re.compile(r"/rating\s+(\d{6,})\s+(\d|10)", re.IGNORECASE)
 # 自然语言中的车号: JM350234 或 纯6-8位数字（排除 QQ 号）
 _CAR_NUMBER_RE = re.compile(r'(?:JM)?(\d{6,8})\b')
 
-# 去除消息开头的 @mention（如 @bot、@JMBot、@YDH*）
+# CQ 码（@mention、图片等）
+_CQ_CODE_RE = re.compile(r'\[CQ:[^\]]+\]')
+# 开头/结尾的 @mention 和 (昵称)
 _AT_RE = re.compile(r'^\s*@\S+\s*')
+_TAIL_AT_RE = re.compile(r'\s*@\S+\s*$')
+_PAREN_NAME_RE = re.compile(r'^\s*\([^)]+\)\s*')
 
 # 消息自动撤回延迟（秒）
 RECALL_DELAY = 110
@@ -289,14 +300,15 @@ def _background_downloader() -> None:
                     # 限速间隔
                     time.sleep(_BG_DOWNLOAD_INTERVAL)
             else:
-                log("background: no pending albums, sleeping 60s")
+                log("background: no pending albums, sleeping 30s")
         except Exception as e:
             log(f"background downloader error: {e}")
-        time.sleep(60)
+        time.sleep(30)
 
 
 def _health_monitor() -> None:
-    """后台线程：定期检查 NapCat 连接状态。"""
+    """后台线程：定期检查 NapCat 连接状态，并同步 Bot QQ。"""
+    global _BOT_QQ
     fail_count = 0
     while True:
         time.sleep(60)
@@ -306,6 +318,14 @@ def _health_monitor() -> None:
                 if fail_count > 0:
                     log(f"health: NapCat reconnected after {fail_count} failures")
                 fail_count = 0
+                # 同步 Bot QQ 号
+                data = resp.get("data", {})
+                if isinstance(data, dict):
+                    qq = str(data.get("user_id", ""))
+                    if qq and qq != _BOT_QQ:
+                        with _BOT_QQ_LOCK:
+                            _BOT_QQ = qq
+                        log(f"health: Bot QQ = {qq}")
             else:
                 fail_count += 1
                 log(f"health: NapCat unhealthy (fail={fail_count})")
@@ -818,6 +838,7 @@ def onebot_handler():
     log(f"message received: type={event_type} text={message_text!r}")
     if not message_text:
         return jsonify({"ok": True})
+
     # 输入长度限制（防 DoS）
     if len(message_text) > 2000:
         log(f"message too long: {len(message_text)} chars")
@@ -835,15 +856,36 @@ def onebot_handler():
         return jsonify({"ok": False, "error": "group not allowed"}), 403
 
     msg = message_text.strip()
-    # 去除开头的 @mention
+    # 清理 CQ 码（防止 QQ 号被误检测为车号）
+    msg = _CQ_CODE_RE.sub('', msg)
+    # 去除开头/结尾的 @mention 和 (昵称)
     msg = _AT_RE.sub('', msg).strip()
+    msg = _TAIL_AT_RE.sub('', msg).strip()
+    msg = _PAREN_NAME_RE.sub('', msg).strip()
     log(f"msg={msg!r}")
 
-    # 频率限制检查（仅对命令生效）
-    is_command = any(r.search(msg) for r in [COMMAND_PING_RE, COMMAND_JMURL_RE, COMMAND_HELP_RE, COMMAND_SE_RE, COMMAND_DL_RE, COMMAND_STATS_RE, COMMAND_TOP_RE, COMMAND_INFO_RE, COMMAND_RECENT_RE, COMMAND_RANDOM_RE, COMMAND_FAV_RE, COMMAND_SYSINFO_RE, COMMAND_PREFS_RE, COMMAND_COVER_RE, COMMAND_RATING_RE])
-    if is_command and not _check_rate_limit(user_id, group_id):
-        log(f"rate limited: user={user_id} group={group_id}")
-        return jsonify({"ok": False, "error": "rate limited"}), 429
+    # ── / 指令始终响应（无需 @mention）──
+    is_slash_cmd = msg.startswith("/")
+    
+    if is_slash_cmd:
+        # 频率限制检查（仅对命令生效）
+        is_command = any(r.search(msg) for r in [COMMAND_PING_RE, COMMAND_JMURL_RE, COMMAND_HELP_RE, COMMAND_SE_RE, COMMAND_DL_RE, COMMAND_STATS_RE, COMMAND_TOP_RE, COMMAND_INFO_RE, COMMAND_RECENT_RE, COMMAND_RANDOM_RE, COMMAND_FAV_RE, COMMAND_SYSINFO_RE, COMMAND_PREFS_RE, COMMAND_COVER_RE, COMMAND_RATING_RE])
+        if is_command and not _check_rate_limit(user_id, group_id):
+            log(f"rate limited: user={user_id} group={group_id}")
+            return jsonify({"ok": False, "error": "rate limited"}), 429
+    else:
+        # ── 非 / 指令：群聊需要 @机器人（支持 CQ码 和手打 @bot/@JMBot）──
+        if event.get("message_type") == "group":
+            with _BOT_QQ_LOCK:
+                bot_qq = _BOT_QQ
+            if bot_qq:
+                # 方式1: QQ @提及 = [CQ:at,qq=2837430647]
+                has_cq_at = f"[CQ:at,qq={bot_qq}]" in message_text
+                # 方式2: 手打 @bot / @JMBot（NapCat 会保留纯文本）
+                has_text_at = bool(re.search(r'@(bot|JMBot|jmBot|jm bot)', message_text, re.IGNORECASE))
+                if not has_cq_at and not has_text_at:
+                    log(f"skipped: bot not @mentioned")
+                    return jsonify({"ok": True})
 
     # /ping - 快速诊断：验证消息回路通畅
     if COMMAND_PING_RE.search(msg):
@@ -1215,17 +1257,21 @@ print(f"JM{{album[0]}}  {{album[1]}}")
         log_usage(event.get("user_id"), event.get("group_id"), "cover", album_id)
         cover_url = f"https://cdn-msp.jmapiproxy1.cc/media/photos/{album_id}/00001.webp"
         try:
-            # 发送图片消息
+            # 发送图片消息并调度撤回
             if event.get("message_type") == "group":
-                send_onebot_api("send_group_msg", {
+                img_resp = send_onebot_api("send_group_msg", {
                     "group_id": event.get("group_id"),
                     "message": f"[CQ:image,file={cover_url},type=show,id=40000]\nJM{album_id} 封面",
                 })
             else:
-                send_onebot_api("send_private_msg", {
+                img_resp = send_onebot_api("send_private_msg", {
                     "user_id": event.get("user_id"),
                     "message": f"[CQ:image,file={cover_url},type=show,id=40000]\nJM{album_id} 封面",
                 })
+            if isinstance(img_resp, dict):
+                img_msg_id = (img_resp.get("data") or {}).get("message_id")
+                if img_msg_id is not None:
+                    schedule_recall(img_msg_id)
             reply_to_event(event, f"🖼️ JM{album_id} 封面已发送")
         except Exception as e:
             reply_to_event(event, f"❌ 封面发送失败: {e}")
@@ -1369,6 +1415,17 @@ print(f"JM{{album[0]}}  {{album[1]}}")
 if __name__ == "__main__":
     import sys
     print("[bot] Starting...", flush=True)
+    # 启动时获取 Bot QQ 号
+    if not _BOT_QQ:
+        try:
+            resp = send_onebot_api("get_login_info", {})
+            data = resp.get("data", {}) if isinstance(resp, dict) else {}
+            qq = str(data.get("user_id", ""))
+            if qq:
+                _BOT_QQ = qq
+                print(f"[bot] Bot QQ = {qq}", flush=True)
+        except Exception as e:
+            print(f"[bot] WARNING: could not get bot QQ: {e}", flush=True)
     start_background_downloader()
     port = int(os.getenv("PORT", "9001"))
     threads = int(os.getenv("WORKER_THREADS", "4"))

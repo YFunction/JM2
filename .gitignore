@@ -169,6 +169,6 @@ gemini.md
 *.db-shm
 *.db-wal
 # PDF output
-my_pdf_output/
+downloads/
 # Bot runtime logs (contain user QQ numbers)
 logs/
