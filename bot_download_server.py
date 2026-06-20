@@ -33,6 +33,10 @@ _FAV_FILE = _LOG_DIR / "favorites.json"
 _PREFS_FILE = _LOG_DIR / "preferences.json"
 _RATING_FILE = _LOG_DIR / "ratings.json"
 
+# 搜索上下文记忆（按群存储，支持 n/p 翻页和 d 快捷下载）
+_search_context: dict = {}  # {group_id: {query, sort, top_n, page, ids}}
+_search_context_lock = threading.Lock()
+
 # JM 地址常量（模块级导入，避免 Flask 线程中 asyncio 冲突）
 _JM_WEB_URL = "https://jmcomicgo(dot)org"
 _JM_REDIRECT_URL = "https://jm365(dot)work/3YeBdF"
@@ -953,20 +957,19 @@ for i, (aid, title) in enumerate(page):
             result_text = run_search(query, sort=sort, top_n=top_n, page=page, search_type=search_type)
             # 记录搜索结果中的本子
             log_album_from_search(result_text, source="search")
-            # 构造内联按钮（仅关键词搜索时显示）
-            kb = None
-            if search_type is None and not re.fullmatch(r'\d+', query):
-                ids = re.findall(r'JM(\d{6,})', result_text)
-                nav_buttons = []
-                if page > 1:
-                    nav_buttons.append({"text": "⬅ 上一页", "action": {"type": 2, "label": "上一页", "data": f"/search {query} page={page-1} top={top_n}" + (f" sort={sort}" if sort else ""), "enter": False}})
-                nav_buttons.append({"text": "下一页 ➡", "action": {"type": 2, "label": "下一页", "data": f"/search {query} page={page+1} top={top_n}" + (f" sort={sort}" if sort else ""), "enter": False}})
-                rows = [{"buttons": nav_buttons}]
-                if ids:
-                    dl_ids = " ".join(ids[:3])
-                    rows.append({"buttons": [{"text": f"📥 下载前{min(3,len(ids))}个", "action": {"type": 2, "label": "下载", "data": f"/download {dl_ids}", "enter": False}}]})
-                kb = {"rows": rows}
-            reply_to_event(event, result_text, keyboard=kb)
+            # 提取本子 ID 并保存搜索上下文
+            ids = re.findall(r'JM(\d{6,})', result_text)
+            if group_id and ids and search_type is None:
+                with _search_context_lock:
+                    _search_context[str(group_id)] = {
+                        "query": query, "sort": sort, "top_n": top_n,
+                        "page": page, "ids": ids
+                    }
+            # 添加快捷操作提示（仅关键词搜索）
+            hint = ""
+            if ids and search_type is None:
+                hint = f"\n\n💡 回复 n 下一页 | p 上一页 | d1 下载第1个 | d1-3 下载前3个"
+            reply_to_event(event, result_text + hint)
         except Exception as e:
             log(f"search error: {e}")
             reply_to_event(event, f"搜索失败：{e}")
@@ -1205,6 +1208,58 @@ print(f"JM{{album[0]}}  {{album[1]}}")
             reply_to_event(event, f"🔍 检测到车号 JM{album_id}：\n{brief}")
         except Exception:
             pass
+        return jsonify({"ok": True})
+
+    # 快捷翻页: n (下一页) / p (上一页)
+    quick_nav = re.match(r'^[nNpP]$', msg)
+    if quick_nav and group_id:
+        nav = msg.lower()
+        with _search_context_lock:
+            ctx = _search_context.get(str(group_id))
+        if ctx:
+            new_page = ctx["page"] + 1 if nav == 'n' else max(1, ctx["page"] - 1)
+            log(f"quick nav: {nav} -> page {new_page}")
+            result_text = run_search(ctx["query"], sort=ctx["sort"], top_n=ctx["top_n"], page=new_page)
+            # 更新上下文
+            ids = re.findall(r'JM(\d{6,})', result_text)
+            with _search_context_lock:
+                _search_context[str(group_id)] = {**ctx, "page": new_page, "ids": ids}
+            hint = f"\n\n💡 回复 n 下一页 | p 上一页 | d1 下载第1个 | d1-3 下载前3个"
+            reply_to_event(event, result_text + hint)
+        return jsonify({"ok": True})
+
+    # 快捷下载: d1 / d3 / d1-3 / d1,3,5
+    quick_dl = re.match(r'^[dD](\d+)(?:[-~](\d+))?$', msg)
+    if quick_dl and group_id:
+        start = int(quick_dl.group(1))
+        end = int(quick_dl.group(2)) if quick_dl.group(2) else start
+        with _search_context_lock:
+            ctx = _search_context.get(str(group_id))
+        if ctx and ctx.get("ids"):
+            all_ids = ctx["ids"]
+            selected = []
+            for i in range(start, min(end, len(all_ids)) + 1):
+                if 1 <= i <= len(all_ids):
+                    selected.append(all_ids[i - 1])
+            if selected:
+                log(f"quick dl: {start}-{end} -> {selected}")
+                reply_to_event(event, f"⏳ 下载 {len(selected)} 个: {', '.join(f'JM{i}' for i in selected)}")
+                def _quick_dl():
+                    results = []
+                    for aid in selected:
+                        try:
+                            with lock:
+                                rt, pdf_path = run_download(aid)
+                            if pdf_path and pdf_path.is_file():
+                                _mark_downloaded(aid)
+                                send_file_to_target(event, pdf_path)
+                            results.append(f"✅ JM{aid}")
+                        except Exception as e:
+                            results.append(f"❌ JM{aid}: {e}")
+                    reply_to_event(event, "\n".join(results))
+                threading.Thread(target=_quick_dl, daemon=True).start()
+            else:
+                reply_to_event(event, "❌ 序号超出范围")
         return jsonify({"ok": True})
 
     log(f"no command matched for msg={msg!r}")
