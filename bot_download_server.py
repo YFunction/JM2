@@ -21,13 +21,86 @@ ONEBOT_ACCESS_TOKEN = os.getenv("ONEBOT_ACCESS_TOKEN", "")
 
 SEARCH_SCRIPT = Path(__file__).resolve().parent / "search_album_info.py"
 
+# 日志路径
+_LOG_DIR = Path(__file__).resolve().parent / "logs"
+_USAGE_LOG = _LOG_DIR / "usage.log"
+_ALBUM_LOG = _LOG_DIR / "albums.log"
+
+# JM 地址常量（模块级导入，避免 Flask 线程中 asyncio 冲突）
+_JM_WEB_URL = "https://jmcomicgo(dot)org"
+_JM_REDIRECT_URL = "https://jm365(dot)work/3YeBdF"
+
 lock = threading.Lock()
-COMMAND_DL_RE = re.compile(r"^/download\s+(\d{6,})\s*$", re.IGNORECASE)
-COMMAND_SE_RE = re.compile(r"^/search\s+(.+)\s*$", re.IGNORECASE)
+COMMAND_DL_RE = re.compile(r"/download\s+(\d{6,})", re.IGNORECASE)
+COMMAND_SE_RE = re.compile(r"/search\s+(.+)", re.IGNORECASE)
+COMMAND_PING_RE = re.compile(r"/ping", re.IGNORECASE)
+COMMAND_HELP_RE = re.compile(r"/help", re.IGNORECASE)
+COMMAND_JMURL_RE = re.compile(r"/jmurl", re.IGNORECASE)
+
+# 去除消息开头的 @mention（如 @bot、@JMBot）
+_AT_RE = re.compile(r'^\s*@\S+\s*')
+
+# 消息自动撤回延迟（秒）
+RECALL_DELAY = 110
+RECALL_NOTICE = "\n\n⏰ 此消息将在1分50秒后自动撤回"
 
 
 def log(msg: str) -> None:
-    print(f"[bot] {msg}")
+    print(f"[bot] {msg}", flush=True)
+
+
+def _ensure_log_dir() -> None:
+    _LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log_usage(user_id, group_id, command: str, detail: str = "") -> None:
+    """记录使用日志。"""
+    _ensure_log_dir()
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] user={user_id} group={group_id} cmd={command}"
+    if detail:
+        line += f" {detail}"
+    with open(_USAGE_LOG, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def log_album(album_id: str, title: str, tags: str = "", source: str = "search") -> None:
+    """记录访问的本子信息。"""
+    _ensure_log_dir()
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] JM{album_id} | {title}"
+    if tags:
+        line += f" | 标签: {tags}"
+    line += f" | 来源: {source}"
+    with open(_ALBUM_LOG, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def log_album_from_search(stdout: str, source: str = "search") -> None:
+    """从搜索脚本的 stdout 中提取 JM ID 和标题，写入 album 日志。"""
+    # 格式1: 关键词搜索结果 — "JM123456  标题..."
+    for m in re.finditer(r'JM(\d{6,})\s{2,}(.+?)(?:\s{2,}|$)', stdout):
+        log_album(m.group(1), m.group(2).strip(), source=source)
+    # 格式2: ID 精确查询 — "[标题]\nJM123456"
+    for m in re.finditer(r'\[([^\]]+)\]\nJM(\d{6,})', stdout):
+        log_album(m.group(2), m.group(1).strip(), source=source)
+
+
+def schedule_recall(message_id: int | str) -> None:
+    """在 RECALL_DELAY 秒后撤回指定消息。"""
+    def _recall():
+        try:
+            resp = send_onebot_api("delete_msg", {"message_id": int(message_id)})
+            log(f"recalled message {message_id}: {resp}")
+        except Exception as e:
+            log(f"recall failed for {message_id}: {e}")
+
+    timer = threading.Timer(RECALL_DELAY, _recall)
+    timer.daemon = True
+    timer.start()
+    log(f"scheduled recall for message {message_id} in {RECALL_DELAY}s")
 
 
 # 搜索排序关键词（按长词优先匹配）
@@ -215,7 +288,7 @@ def reply_to_event(
     else:
         file_sent = False
 
-    # Step 2: Build the appropriate text message
+    # Step 2: Build the appropriate text message (追加撤回提示)
     if file_sent:
         reply_text = f"✅ {text}"
     else:
@@ -224,21 +297,34 @@ def reply_to_event(
             reply_text += f"\n⚠️ 文件发送失败: {file_err}"
         elif file_path is not None and file_path.is_file():
             reply_text += f"\n📎 文件: http://127.0.0.1:9001/files/{file_path.name}"
+    reply_text += RECALL_NOTICE
 
-    # Step 3: Send text message
+    # Step 3: Send text message and schedule recall
     try:
         if message_type == "private":
-            send_onebot_api("send_private_msg", {
+            resp = send_onebot_api("send_private_msg", {
                 "user_id": event.get("user_id"),
                 "message": reply_text,
             })
         elif message_type == "group":
-            send_onebot_api("send_group_msg", {
+            resp = send_onebot_api("send_group_msg", {
                 "group_id": event.get("group_id"),
                 "message": reply_text,
             })
         else:
             log(f"unsupported message_type={message_type}")
+            return
+
+        # 提取 message_id 并调度撤回
+        msg_id = None
+        if isinstance(resp, dict):
+            data = resp.get("data", {})
+            if isinstance(data, dict):
+                msg_id = data.get("message_id")
+        if msg_id is not None:
+            schedule_recall(msg_id)
+        else:
+            log(f"could not extract message_id from response: {resp}")
     except Exception as e:
         log(f"text reply failed: {e}")
 
@@ -277,7 +363,15 @@ def run_search(query: str, sort: str = None, top_n: int = None) -> str:
 
     if proc.returncode != 0:
         err_detail = (stderr + stdout)[:800]
-        return f"查询失败 (rc={proc.returncode})\n{err_detail}"
+        # 友好化常见错误
+        if '本子不存在' in err_detail:
+            return f"❌ 本子 JM{query} 不存在，请检查 ID 是否正确"
+        if '查询失败' in err_detail:
+            # 提取 "查询失败: xxx" 中的核心信息
+            m = re.search(r'查询失败:\s*(.+?)(?:\n|$)', err_detail)
+            if m:
+                return f"❌ {m.group(1).strip()}"
+        return f"❌ 查询失败\n{err_detail[:400]}"
 
     # 过滤掉 JMComic 库的内部日志行（以 [时间戳] 或 [线程名] 开头）
     log_pattern = re.compile(r'^\[(20\d{2}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}|MainThread|Thread-\d+|api\.)')
@@ -375,17 +469,35 @@ def onebot_handler():
         return jsonify({"ok": True})
 
     msg = message_text.strip()
+    # 去除开头的 @mention
+    msg = _AT_RE.sub('', msg).strip()
     log(f"msg={msg!r}")
 
     # /ping - 快速诊断：验证消息回路通畅
-    if msg.lower() == "/ping":
+    if COMMAND_PING_RE.search(msg):
         log("ping received, replying...")
+        log_usage(event.get("user_id"), event.get("group_id"), "ping")
         reply_to_event(event, "pong!  Bot 运行正常。")
         return jsonify({"ok": True})
 
+    # /jmurl - 输出 JM 的网页版和下载地址（点替换为 (dot)）
+    if COMMAND_JMURL_RE.search(msg):
+        log("jmurl requested, replying...")
+        log_usage(event.get("user_id"), event.get("group_id"), "jmurl")
+        jmurl_text = (
+            "🌐 JM 禁漫地址\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"📖 网页版: {_JM_WEB_URL}\n"
+            f"🔗 永久入口: {_JM_REDIRECT_URL}\n\n"
+            "⚠️ 请将 (dot) 替换为 . 后访问"
+        )
+        reply_to_event(event, jmurl_text)
+        return jsonify({"ok": True})
+
     # /help - 显示全部指令帮助
-    if msg.lower() == "/help":
+    if COMMAND_HELP_RE.search(msg):
         log("help requested, replying...")
+        log_usage(event.get("user_id"), event.get("group_id"), "help")
         help_text = (
             "📖 JMComic Bot 指令帮助\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
@@ -402,23 +514,29 @@ def onebot_handler():
             "  下载指定本子并生成 PDF 文件。\n"
             "  示例:\n"
             "    /download 350234\n\n"
+            "🌐 /jmurl\n"
+            "  获取禁漫网页版和永久入口地址（防和谐格式）\n\n"
             "💓 /ping\n"
             "  Bot 存活检测\n\n"
             "❓ /help\n"
-            "  显示本帮助"
+            "  显示本帮助\n\n"
+            "⏰ 所有消息将在发送后1分50秒自动撤回"
         )
         reply_to_event(event, help_text)
         return jsonify({"ok": True})
 
     # /search <query> [排序] [数量] — 支持 ID 精确查询 或 关键词搜索
-    search_match = COMMAND_SE_RE.fullmatch(msg)
+    search_match = COMMAND_SE_RE.search(msg)
     log(f"/search match: {bool(search_match)}")
     if search_match:
         raw_query = search_match.group(1).strip()
         query, sort, top_n = parse_search_args(raw_query)
+        log_usage(event.get("user_id"), event.get("group_id"), "search", f"query={query!r} sort={sort} top={top_n}")
         log(f"received command: /search query={query!r} sort={sort} top={top_n} from user={event.get('user_id')}")
         try:
             result_text = run_search(query, sort=sort, top_n=top_n)
+            # 记录搜索结果中的本子
+            log_album_from_search(result_text, source="search")
             reply_to_event(event, result_text)
         except Exception as e:
             log(f"search error: {e}")
@@ -426,15 +544,22 @@ def onebot_handler():
         return jsonify({"ok": True})
 
     # /download <album_id>
-    dl_match = COMMAND_DL_RE.fullmatch(msg)
+    dl_match = COMMAND_DL_RE.search(msg)
     log(f"/download match: {bool(dl_match)}")
     if dl_match:
         album_id = dl_match.group(1)
+        log_usage(event.get("user_id"), event.get("group_id"), "download", f"id={album_id}")
         log(f"received command: /download {album_id} from user={event.get('user_id')}")
 
         try:
             with lock:
                 result_text, pdf_path = run_download(album_id)
+            # 记录下载的本子
+            if pdf_path and pdf_path.is_file():
+                # 从文件名提取标题: "[JM123456]标题.pdf"
+                m = re.match(r'\[JM\d+\](.+)\.pdf', pdf_path.name)
+                title = m.group(1).strip() if m else pdf_path.stem
+                log_album(album_id, title, source="download")
             reply_to_event(event, result_text, file_path=pdf_path)
         except Exception as e:
             log(f"error: {e}")

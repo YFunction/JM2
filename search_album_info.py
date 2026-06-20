@@ -92,6 +92,24 @@ def format_search_results(page, keyword: str, sort_order: str, top_n: int) -> st
     return "\n".join(lines)
 
 
+def build_search_query(raw_query: str) -> str:
+    """
+    将用户输入的关键词转为 JM API 搜索查询。
+    多词搜索自动添加 + 前缀实现相关性匹配（要求每词都出现，但不要求紧邻）。
+    若用户已手动使用 +/- 语法则保持原样。
+    """
+    query = raw_query.strip()
+    # 用户已使用 +/- 语法，保持原样
+    if re.search(r'[+-]\S', query):
+        return query
+    # 单字或没有空格，原样搜索
+    words = query.split()
+    if len(words) <= 1:
+        return query
+    # 多词：每词加 + 实现相关性匹配
+    return ' '.join(f'+{w}' for w in words)
+
+
 def main():
     # 强制 UTF-8 避免 Windows GBK 编码问题；Linux 下若 stdout 无 buffer 则跳过
     try:
@@ -144,8 +162,12 @@ def main():
             album = client.get_album_detail(query)
             result = format_album_info(album)
         else:
-            # 关键词搜索（带排序）
-            page = client.search_site(query, page=1, order_by=sort_order)
+            # 关键词搜索（带排序和相关性优化）
+            search_query = build_search_query(query)
+            page = client.search_site(search_query, page=1, order_by=sort_order)
+            # 0 结果时回退：去掉 + 前缀，宽松匹配
+            if page.total == 0 and search_query != query:
+                page = client.search_site(query, page=1, order_by=sort_order)
             result = format_search_results(page, query, sort_order, top_n)
 
     except Exception as e:
