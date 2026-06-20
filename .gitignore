@@ -164,3 +164,9 @@ cython_debug/
 .idea/
 .agent
 gemini.md
+# NapCat runtime databases
+*.db
+*.db-shm
+*.db-wal
+# PDF output
+my_pdf_output/

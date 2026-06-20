@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from typing import Any
@@ -14,19 +15,58 @@ app = Flask(__name__)
 
 SCRIPT_PATH = Path(__file__).resolve().parent / "download_album_to_pdf.py"
 OUTPUT_DIR = Path(os.getenv("DOWNLOAD_OUTPUT_DIR", str((Path(__file__).resolve().parent / "my_pdf_output"))))
-PYTHON_EXE = os.getenv("PYTHON_EXE", r"D:\ProgramData\anaconda3\python.exe")
-ONEBOT_BASE_URL = os.getenv("ONEBOT_BASE_URL", "http://127.0.0.1:9000")
+PYTHON_EXE = os.getenv("PYTHON_EXE", sys.executable)
+ONEBOT_BASE_URL = os.getenv("ONEBOT_BASE_URL", "http://127.0.0.1:3000")
 ONEBOT_ACCESS_TOKEN = os.getenv("ONEBOT_ACCESS_TOKEN", "")
 
 SEARCH_SCRIPT = Path(__file__).resolve().parent / "search_album_info.py"
 
 lock = threading.Lock()
 COMMAND_DL_RE = re.compile(r"^/download\s+(\d{6,})\s*$", re.IGNORECASE)
-COMMAND_SE_RE = re.compile(r"^/search\s+(\d{3,})\s*$", re.IGNORECASE)
+COMMAND_SE_RE = re.compile(r"^/search\s+(.+)\s*$", re.IGNORECASE)
 
 
 def log(msg: str) -> None:
     print(f"[bot] {msg}")
+
+
+# 搜索排序关键词（按长词优先匹配）
+_SEARCH_SORT_KEYS = ['发布时间', '观看次数', '收藏', '点赞', '喜欢', '最新', '观看', '长度', '页数', '图片']
+
+
+def parse_search_args(raw_query: str):
+    """
+    从搜索指令中解析 关键词、排序方式、显示数量。
+
+    示例:
+      "无修正"              → ("无修正", None, 20)
+      "无修正 最新 10"      → ("无修正", "最新", 10)
+      "无修正 观看 5"       → ("无修正", "观看", 5)
+      "无修正 收藏"         → ("无修正", "收藏", 20)
+      "无修正 15"           → ("无修正", None, 15)
+      "关键词 带 空格 最新 8" → ("关键词 带 空格", "最新", 8)
+    """
+    text = raw_query.strip()
+    sort = None
+    top_n = 20
+
+    # 尝试从末尾提取 "排序词 [数字]"  — 长词优先匹配
+    for sk in sorted(_SEARCH_SORT_KEYS, key=len, reverse=True):
+        m = re.search(rf'\s+{re.escape(sk)}(?:\s+(\d{{1,3}}))?\s*$', text)
+        if m:
+            sort = sk
+            if m.group(1):
+                top_n = int(m.group(1))
+            text = text[:m.start()].strip()
+            break
+    else:
+        # 没有排序词，尝试匹配末尾纯数字
+        m_num = re.search(r'\s+(\d{1,3})\s*$', text)
+        if m_num:
+            top_n = int(m_num.group(1))
+            text = text[:m_num.start()].strip()
+
+    return text, sort, min(top_n, 50)  # 最多 50 条
 
 
 def get_event_text(event: dict[str, Any]) -> str:
@@ -212,9 +252,13 @@ def find_latest_pdf(dir_path: Path) -> Path | None:
     return max(pdfs, key=lambda p: p.stat().st_mtime)
 
 
-def run_search(album_id: str) -> str:
-    """查询本子信息，通过 conda Python 子进程调用 jmcomic。"""
-    cmd = [PYTHON_EXE, str(SEARCH_SCRIPT), album_id]
+def run_search(query: str, sort: str = None, top_n: int = None) -> str:
+    """查询本子信息（支持 ID 精确查询 或 关键词搜索），通过子进程调用 jmcomic。"""
+    cmd = [PYTHON_EXE, str(SEARCH_SCRIPT), query]
+    if sort:
+        cmd += ["-s", sort]
+    if top_n is not None:
+        cmd += ["-n", str(top_n)]
     log(f"running search: {' '.join(cmd)}")
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=45)
@@ -244,9 +288,16 @@ def run_search(album_id: str) -> str:
 
 def run_download(album_id: str) -> tuple[str, Path | None]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # 删除旧的 PDF 文件，避免 find_latest_pdf 返回过期结果
+    for old_pdf in OUTPUT_DIR.glob("*.pdf"):
+        try:
+            old_pdf.unlink()
+            log(f"cleaned old pdf: {old_pdf.name}")
+        except Exception as e:
+            log(f"failed to clean old pdf {old_pdf.name}: {e}")
     cmd = [PYTHON_EXE, str(SCRIPT_PATH), album_id, "-o", str(OUTPUT_DIR)]
     log(f"running: {' '.join(cmd)}")
-    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8")
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=600)
     stdout = proc.stdout or ""
     stderr = proc.stderr or ""
     log_output = (stdout + "\n" + stderr).strip()
@@ -332,14 +383,42 @@ def onebot_handler():
         reply_to_event(event, "pong!  Bot 运行正常。")
         return jsonify({"ok": True})
 
-    # /search <album_id>
+    # /help - 显示全部指令帮助
+    if msg.lower() == "/help":
+        log("help requested, replying...")
+        help_text = (
+            "📖 JMComic Bot 指令帮助\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            "🔍 /search <ID|关键词> [排序] [数量]\n"
+            "  查询本子信息。纯数字按ID精确查询，文字按关键词搜索。\n"
+            "  排序: 收藏/最新/观看/长度 (默认: 收藏)\n"
+            "  数量: 1-50 (默认: 20)\n"
+            "  示例:\n"
+            "    /search 350234        → ID精确查询\n"
+            "    /search 无修正          → 收藏排序，前20条\n"
+            "    /search 无修正 最新 5   → 发布时间排序，前5条\n"
+            "    /search 无修正 观看 10  → 观看数排序，前10条\n\n"
+            "📥 /download <ID>\n"
+            "  下载指定本子并生成 PDF 文件。\n"
+            "  示例:\n"
+            "    /download 350234\n\n"
+            "💓 /ping\n"
+            "  Bot 存活检测\n\n"
+            "❓ /help\n"
+            "  显示本帮助"
+        )
+        reply_to_event(event, help_text)
+        return jsonify({"ok": True})
+
+    # /search <query> [排序] [数量] — 支持 ID 精确查询 或 关键词搜索
     search_match = COMMAND_SE_RE.fullmatch(msg)
     log(f"/search match: {bool(search_match)}")
     if search_match:
-        album_id = search_match.group(1)
-        log(f"received command: /search {album_id} from user={event.get('user_id')}")
+        raw_query = search_match.group(1).strip()
+        query, sort, top_n = parse_search_args(raw_query)
+        log(f"received command: /search query={query!r} sort={sort} top={top_n} from user={event.get('user_id')}")
         try:
-            result_text = run_search(album_id)
+            result_text = run_search(query, sort=sort, top_n=top_n)
             reply_to_event(event, result_text)
         except Exception as e:
             log(f"search error: {e}")

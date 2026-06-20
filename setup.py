@@ -25,7 +25,7 @@ setup(
     author_email='93357912+hect0x7@users.noreply.github.com',
     packages=find_packages("src"),
     package_dir={"": "src"},
-    python_requires=">=3.9",
+    python_requires=">=3.8",
     install_requires=[
         'curl_cffi',
         'commonX',
