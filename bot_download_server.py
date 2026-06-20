@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
@@ -28,13 +29,14 @@ _LOG_DIR = Path(__file__).resolve().parent / "logs"
 _USAGE_LOG = _LOG_DIR / "usage.log"
 _ALBUM_LOG = _LOG_DIR / "albums.log"
 _CHAT_LOG_DIR = _LOG_DIR / "chat"
+_FAV_FILE = _LOG_DIR / "favorites.json"
 
 # JM 地址常量（模块级导入，避免 Flask 线程中 asyncio 冲突）
 _JM_WEB_URL = "https://jmcomicgo(dot)org"
 _JM_REDIRECT_URL = "https://jm365(dot)work/3YeBdF"
 
 lock = threading.Lock()
-COMMAND_DL_RE = re.compile(r"/download\s+(\d{6,})", re.IGNORECASE)
+COMMAND_DL_RE = re.compile(r"/download\s+(\d{6,}(?:\s+\d{6,})*)", re.IGNORECASE)
 # /download 后可选 -s / nosend / --store 表示仅存储不发送
 COMMAND_DL_NOSEND_RE = re.compile(r"/download\s+(\d{6,})\b.*?(-s|nosend|--store)", re.IGNORECASE)
 
@@ -58,6 +60,14 @@ COMMAND_SE_RE = re.compile(r"/search\s+(.+)", re.IGNORECASE)
 COMMAND_PING_RE = re.compile(r"/ping", re.IGNORECASE)
 COMMAND_HELP_RE = re.compile(r"/help", re.IGNORECASE)
 COMMAND_JMURL_RE = re.compile(r"/jmurl", re.IGNORECASE)
+COMMAND_STATS_RE = re.compile(r"/stats", re.IGNORECASE)
+COMMAND_TOP_RE = re.compile(r"/top\s*(日榜|周榜|月榜)?", re.IGNORECASE)
+COMMAND_INFO_RE = re.compile(r"/info\s+(\d{6,})", re.IGNORECASE)
+COMMAND_RECENT_RE = re.compile(r"/recent", re.IGNORECASE)
+COMMAND_RANDOM_RE = re.compile(r"/random", re.IGNORECASE)
+COMMAND_FAV_RE = re.compile(r"/fav\s*(add|list|remove|del)?\s*(\d{6,})?", re.IGNORECASE)
+# 自然语言中的车号: JM350234 或 纯6+位数字
+_CAR_NUMBER_RE = re.compile(r'(?:JM)?(\d{6,})\b')
 
 # 去除消息开头的 @mention（如 @bot、@JMBot）
 _AT_RE = re.compile(r'^\s*@\S+\s*')
@@ -764,7 +774,7 @@ def onebot_handler():
     log(f"msg={msg!r}")
 
     # 频率限制检查（仅对命令生效）
-    is_command = any(r.search(msg) for r in [COMMAND_PING_RE, COMMAND_JMURL_RE, COMMAND_HELP_RE, COMMAND_SE_RE, COMMAND_DL_RE])
+    is_command = any(r.search(msg) for r in [COMMAND_PING_RE, COMMAND_JMURL_RE, COMMAND_HELP_RE, COMMAND_SE_RE, COMMAND_DL_RE, COMMAND_STATS_RE, COMMAND_TOP_RE, COMMAND_INFO_RE, COMMAND_RECENT_RE, COMMAND_RANDOM_RE, COMMAND_FAV_RE])
     if is_command and not _check_rate_limit(user_id, group_id):
         log(f"rate limited: user={user_id} group={group_id}")
         return jsonify({"ok": False, "error": "rate limited"}), 429
@@ -790,6 +800,74 @@ def onebot_handler():
         reply_to_event(event, jmurl_text)
         return jsonify({"ok": True})
 
+    # /stats - 显示统计信息
+    if COMMAND_STATS_RE.search(msg):
+        log("stats requested, replying...")
+        log_usage(event.get("user_id"), event.get("group_id"), "stats")
+        pdf_count = len(list(OUTPUT_DIR.glob("[JM*]*.pdf")))
+        downloaded = len(_load_downloaded_ids())
+        total_size = sum(p.stat().st_size for p in OUTPUT_DIR.glob("[JM*]*.pdf"))
+        size_str = f"{total_size/1024/1024:.0f}MB" if total_size else "0MB"
+        pending = len(_get_pending_albums())
+        stats_text = (
+            "📊 Bot 统计\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"📥 已下载: {downloaded} 个本子\n"
+            f"📄 PDF 文件: {pdf_count} 个（{size_str}）\n"
+            f"⏳ 待下载: {pending} 个\n"
+            f"💾 磁盘: {size_str}"
+        )
+        reply_to_event(event, stats_text)
+        return jsonify({"ok": True})
+
+    # /top [日榜|周榜|月榜]
+    if COMMAND_TOP_RE.search(msg):
+        m = COMMAND_TOP_RE.search(msg)
+        period = (m.group(1) or "日榜").strip()
+        log(f"top requested: {period}")
+        log_usage(event.get("user_id"), event.get("group_id"), "top", period)
+        period_map = {"日榜": "day_ranking", "周榜": "week_ranking", "月榜": "month_ranking"}
+        method = period_map.get(period, "day_ranking")
+        try:
+            # 用子进程调用排行榜
+            cmd = [PYTHON_EXE, "-c", f"""
+import sys, os
+sys.stdout = open(os.devnull, 'w')
+from jmcomic import JmOption
+o = JmOption.default(); c = o.build_jm_client()
+page = c.{method}(page=1)
+sys.stdout = sys.__stdout__
+print(f"\\u0014{period} TOP10\\u0014")
+for i, (aid, title) in enumerate(page):
+    if i >= 10: break
+    print(f"JM{{aid}}  {{title}}")
+"""]
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            stdout = proc.stdout or ""
+            if proc.returncode != 0:
+                reply_to_event(event, "❌ 获取排行榜失败")
+            else:
+                reply_to_event(event, stdout.strip())
+        except Exception as e:
+            log(f"top error: {e}")
+            reply_to_event(event, f"❌ {e}")
+        return jsonify({"ok": True})
+
+    # /info <ID> - 精简本子信息
+    info_match = COMMAND_INFO_RE.search(msg)
+    if info_match:
+        album_id = info_match.group(1)
+        log_usage(event.get("user_id"), event.get("group_id"), "info", album_id)
+        log(f"info requested: {album_id}")
+        result = run_search(album_id)  # ID 查询
+        # 精简输出：取前 5 行
+        lines = result.split("\n")
+        brief = "\n".join(lines[:6])
+        if len(lines) > 6:
+            brief += f"\n... 共 {len(lines)} 行，/search {album_id} 查看完整"
+        reply_to_event(event, brief)
+        return jsonify({"ok": True})
+
     # /help - 显示全部指令帮助
     if COMMAND_HELP_RE.search(msg):
         log("help requested, replying...")
@@ -797,30 +875,24 @@ def onebot_handler():
         help_text = (
             "📖 JMComic Bot 指令帮助\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            "🔍 /search <ID|关键词> [排序] [数量]\n"
-            "  /search <关键词> sort=排序 top=数量 page=页码 type=类型\n"
-            "  查询本子信息。纯数字按ID精确查询，文字按关键词搜索。\n"
-            "  排序: 收藏/最新/观看/长度 (默认: 收藏)\n"
-            "  类型: normal(默认)/author(作者)/tag(标签)\n"
-            "  数量: 旧格式 1-50, 新格式 1-80 (默认20)\n"
-            "  示例:\n"
-            "    /search 350234              → ID查询（可加 --brief 简洁模式）\n"
-            "    /search 原神 最新 5          → 旧格式\n"
-            "    /search 原神 sort=观看 top=10 page=2 → 第2页\n"
-            "    /search MANA type=author top=5 → 按作者搜索\n\n"
-            "    /search 原神 sort=收藏 top=5 page=3 → 收藏排序，第3页\n\n"
-            "📥 /download <ID> [-s|nosend]\n"
-            "  下载指定本子并生成 PDF 文件。加 -s/nosend 仅存储不发送。\n"
-            "  示例:\n"
-            "    /download 350234\n"
-            "    /download 350234 -s     → 仅存储，不发送文件\n\n"
-            "🌐 /jmurl\n"
-            "  获取禁漫网页版和永久入口地址（防和谐格式）\n\n"
-            "💓 /ping\n"
-            "  Bot 存活检测\n\n"
-            "❓ /help\n"
-            "  显示本帮助\n\n"
-            "⏰ 所有消息将在发送后1分50秒自动撤回"
+            "🔍 /search <ID|关键词> [参数...]\n"
+            "  查询本子。sort=排序 top=数量 page=页码 type=类型\n"
+            "  排序: 收藏/最新/观看/长度 类型: author/tag\n"
+            "  示例: /search 原神 sort=观看 top=10 page=2\n\n"
+            "📥 /download <ID> [ID...] [-s]\n"
+            "  下载并发送 PDF。加 -s 仅存储。支持多 ID\n"
+            "  示例: /download 350234、/download 350234 350235 -s\n\n"
+            "📊 /stats → Bot 统计\n"
+            "🔝 /top [日榜|周榜|月榜] → 排行榜\n"
+            "ℹ️ /info <ID> → 精简详情\n"
+            "🕐 /recent → 最近查询记录\n"
+            "🎲 /random → 随机推荐\n"
+            "⭐ /fav add|list|remove [ID] → 收藏\n"
+            "🌐 /jmurl → 禁漫地址\n"
+            "💓 /ping → 存活检测\n"
+            "❓ /help → 本帮助\n\n"
+            "⏰ 所有消息将在发送后1分50秒自动撤回\n"
+            "💡 聊天中提及 JM车号 会自动识别"
         )
         reply_to_event(event, help_text)
         return jsonify({"ok": True})
@@ -843,32 +915,134 @@ def onebot_handler():
             reply_to_event(event, f"搜索失败：{e}")
         return jsonify({"ok": True})
 
-    # /download <album_id> [-s|nosend]
+    # /download <id1> [id2...] [-s|nosend]
     dl_match = COMMAND_DL_RE.search(msg)
     log(f"/download match: {bool(dl_match)}")
     if dl_match:
-        album_id = dl_match.group(1)
+        ids_str = dl_match.group(1)
+        album_ids = re.findall(r'\d{6,}', ids_str)
         nosend = bool(COMMAND_DL_NOSEND_RE.search(msg))
-        log_usage(event.get("user_id"), event.get("group_id"), "download", f"id={album_id}" + (" nosend" if nosend else ""))
-        log(f"received command: /download {album_id} nosend={nosend} from user={event.get('user_id')}")
+        log_usage(event.get("user_id"), event.get("group_id"), "download", f"ids={album_ids}" + (" nosend" if nosend else ""))
+        log(f"received command: /download {album_ids} nosend={nosend}")
+        # 立即回复 "开始下载"
+        count = len(album_ids)
+        reply_to_event(event, f"⏳ 开始下载 {count} 个本子（{', '.join(album_ids)}）...")
+        # 异步下载
+        def _async_dl():
+            results = []
+            for aid in album_ids:
+                try:
+                    with lock:
+                        rt, pdf_path = run_download(aid)
+                    if pdf_path and pdf_path.is_file():
+                        _mark_downloaded(aid)
+                        m = re.match(r'\[JM\d+\](.+)\.pdf', pdf_path.name)
+                        title = m.group(1).strip() if m else pdf_path.stem
+                        log_album(aid, title, source="download")
+                    if nosend:
+                        results.append(f"✅ JM{aid}")
+                    else:
+                        results.append(rt)
+                        if pdf_path and pdf_path.is_file():
+                            send_file_to_target(event, pdf_path)
+                except Exception as e:
+                    results.append(f"❌ JM{aid}: {e}")
+            reply_to_event(event, "\n".join(results))
+        threading.Thread(target=_async_dl, daemon=True).start()
+        return jsonify({"ok": True})
 
+    # /recent - 最近查询的本子
+    if COMMAND_RECENT_RE.search(msg):
+        log("recent requested")
+        log_usage(event.get("user_id"), event.get("group_id"), "recent")
         try:
-            with lock:
-                result_text, pdf_path = run_download(album_id)
-            # 记录已下载
-            if pdf_path and pdf_path.is_file():
-                _mark_downloaded(album_id)
-                m = re.match(r'\[JM\d+\](.+)\.pdf', pdf_path.name)
-                title = m.group(1).strip() if m else pdf_path.stem
-                log_album(album_id, title, source="download")
-            if nosend:
-                reply_to_event(event, f"✅ 下载完成（未发送）: JM{album_id}")
+            if _ALBUM_LOG.exists():
+                lines = []
+                seen = set()
+                with open(_ALBUM_LOG, "r", encoding="utf-8") as f:
+                    for line in reversed(list(f)):
+                        m = re.search(r'JM(\d{6,})\s*\|\s*(.+?)\s*\|', line)
+                        if m and m.group(1) not in seen:
+                            seen.add(m.group(1))
+                            lines.append(f"JM{m.group(1)}  {m.group(2).strip()}")
+                            if len(lines) >= 10:
+                                break
+                text = "🕐 最近查询\n━━━━━━━━━━━━━━━━━━\n\n" + "\n".join(lines) if lines else "暂无记录"
             else:
-                reply_to_event(event, result_text, file_path=pdf_path)
+                text = "暂无记录"
         except Exception as e:
-            log(f"error: {e}")
-            reply_to_event(event, f"处理失败：{e}")
+            text = f"读取失败: {e}"
+        reply_to_event(event, text)
+        return jsonify({"ok": True})
 
+    # /random - 随机推荐
+    if COMMAND_RANDOM_RE.search(msg):
+        log("random requested")
+        log_usage(event.get("user_id"), event.get("group_id"), "random")
+        try:
+            import random
+            cmd = [PYTHON_EXE, "-c", f"""
+import sys, random
+sys.stdout = open('/dev/null', 'w')
+from jmcomic import JmOption
+o = JmOption.default(); c = o.build_jm_client()
+page = c.day_ranking(page=random.randint(1, 10))
+album = random.choice(list(page.iter_id_title()))
+sys.stdout = sys.__stdout__
+print(f"JM{{album[0]}}  {{album[1]}}")
+"""]
+            proc = _run_subprocess_with_retry(cmd, timeout=30)
+            reply_to_event(event, f"🎲 {proc.stdout.strip()}")
+        except Exception as e:
+            reply_to_event(event, f"❌ {e}")
+        return jsonify({"ok": True})
+
+    # /fav [add|list|remove] [ID]
+    fav_match = COMMAND_FAV_RE.search(msg)
+    if fav_match:
+        action = fav_match.group(1) or "list"
+        fav_id = fav_match.group(2)
+        log(f"fav requested: {action} {fav_id}")
+        log_usage(event.get("user_id"), event.get("group_id"), "fav", f"{action} {fav_id or ''}")
+        user_key = str(event.get("user_id"))
+        try:
+            favs = {}
+            if _FAV_FILE.exists():
+                favs = json.loads(_FAV_FILE.read_text(encoding="utf-8"))
+            if action in ("add", None) and fav_id:
+                favs.setdefault(user_key, [])
+                if fav_id not in favs[user_key]:
+                    favs[user_key].append(fav_id)
+                _FAV_FILE.write_text(json.dumps(favs, ensure_ascii=False, indent=2), encoding="utf-8")
+                reply_to_event(event, f"⭐ 已收藏 JM{fav_id}")
+            elif action in ("remove", "del") and fav_id:
+                if user_key in favs and fav_id in favs[user_key]:
+                    favs[user_key].remove(fav_id)
+                _FAV_FILE.write_text(json.dumps(favs, ensure_ascii=False, indent=2), encoding="utf-8")
+                reply_to_event(event, f"🗑️ 已取消收藏 JM{fav_id}")
+            elif action == "list":
+                user_favs = favs.get(user_key, [])
+                if user_favs:
+                    text = "⭐ 我的收藏\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(f"JM{fid}" for fid in user_favs[-20:])
+                else:
+                    text = "暂无收藏"
+                reply_to_event(event, text)
+        except Exception as e:
+            reply_to_event(event, f"❌ {e}")
+        return jsonify({"ok": True})
+
+    # 智能车号识别：聊天中提及 JM123456 自动查
+    car_match = _CAR_NUMBER_RE.search(msg)
+    if car_match and not any(r.search(msg) for r in [COMMAND_SE_RE, COMMAND_DL_RE, COMMAND_INFO_RE]):
+        album_id = car_match.group(1)
+        log(f"car number detected: {album_id}")
+        try:
+            result = run_search(album_id)
+            # 只取前3行
+            brief = "\n".join(result.split("\n")[:3])
+            reply_to_event(event, f"🔍 检测到车号 JM{album_id}：\n{brief}")
+        except Exception:
+            pass
         return jsonify({"ok": True})
 
     log(f"no command matched for msg={msg!r}")
