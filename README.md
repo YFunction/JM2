@@ -4,18 +4,19 @@
 通过 [NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot v11 协议）接入 QQ，
 提供禁漫本子搜索、详情查询、下载转 PDF 等功能。
 
-## 🎬 演示视频
+## ⚠️ 免责声明
 
-[![2000字！宇宙安全声明合集](https://i2.hdslb.com/bfs/archive/b1e8f5a3c4d2e6a7f901234567890abcdef.jpg)](https://www.bilibili.com/video/BV1Ts4y1F7r3/)
+<iframe src="//player.bilibili.com/player.html?bvid=BV1Ts4y1F7r3&autoplay=1&page=1" 
+  scrolling="no" border="0" frameborder="no" framespacing="0" allowfullscreen="true"
+  width="100%" height="500"></iframe>
 
-> 📺 [2000字！宇宙安全声明合集 — 哔哩哔哩](https://www.bilibili.com/video/BV1Ts4y1F7r3/)
+> 📺 视频：[2000字！宇宙安全声明合集 — 哔哩哔哩](https://www.bilibili.com/video/BV1Ts4y1F7r3/)
 
 ## 🤖 体验 QQ
 
 | 项目 | 详情 |
 |------|------|
 | 体验 QQ | **2837430647**（JMBot） |
-
 | 触发方式 | `@JMBot` 或 `/` 指令 |
 
 ## 功能
@@ -178,8 +179,7 @@ JM2/
 
 - [JMComic-Crawler-Python](https://github.com/hect0x7/JMComic-Crawler-Python)
 - [NapCat](https://github.com/NapNeko/NapCatQQ)
-- [Bilibili 演示视频](https://www.bilibili.com/video/BV1Ts4y1F7r3/)
 
 ## 免责声明
 
-本项目仅供学习交流使用，请遵守相关法律法规，合理使用。
+⚠️ 请先观看上方免责声明视频。本项目仅供学习交流使用，请遵守相关法律法规，合理使用。
