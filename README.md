@@ -26,9 +26,10 @@
 /search 无修正 5            → top=5
 ```
 
-**新格式（key=value，支持分页）**：
+**新格式（key=value，支持分页和类型）**：
 ```
 /search 原神 sort=观看 top=10 page=2
+/search MANA type=author top=5
 ```
 
 | 参数 | 说明 | 默认值 |
@@ -36,6 +37,9 @@
 | `sort=` | 排序：收藏/最新/观看/长度 | `收藏` |
 | `top=` 或 `page_size=` | 每页条数 | `20` |
 | `page=` | 页码（翻页用） | `1` |
+| `type=` | normal / author(作者) / tag(标签) | `normal` |
+
+搜索结果会显示 ✍️作者名，ID 查询支持简洁模式。
 
 ### 其他特性
 

@@ -240,17 +240,18 @@ def parse_search_args(raw_query: str):
 
     支持两种格式:
       旧格式: "无修正 最新 10"         → 位置参数
-      新格式: "无修正 sort=最新 top=20 page=2" → key=value 参数
+      新格式: "无修正 sort=最新 top=20 page=2 type=author" → key=value 参数
 
-    返回: (query, sort, top_n, page)
+    返回: (query, sort, top_n, page, search_type)
     """
     text = raw_query.strip()
     sort = None
     top_n = 20
     page = 1
+    search_type = None  # None=normal, "author", "tag"
 
     # ── 新格式: key=value ──
-    kv_pattern = re.compile(r'\b(sort|top|page_size|page)=(\S+)', re.IGNORECASE)
+    kv_pattern = re.compile(r'\b(sort|top|page_size|page|type)=(\S+)', re.IGNORECASE)
     kv_found = list(kv_pattern.finditer(text))
     if kv_found:
         for m in kv_found:
@@ -273,11 +274,16 @@ def parse_search_args(raw_query: str):
                     page = int(val)
                 except ValueError:
                     pass
+            elif key == 'type':
+                if val in ('author', 'tag', 'normal'):
+                    search_type = val
+                else:
+                    log(f"unknown search type: {val}")
         # 移除所有 kv 参数，剩余为关键词
         text = kv_pattern.sub('', text).strip()
         top_n = max(1, min(top_n, 80))   # 每页最多 80
         page = max(1, min(page, 1000))   # 页码 1-1000
-        return text, sort, top_n, page
+        return text, sort, top_n, page, search_type
 
     # ── 旧格式: 位置参数 ──
     for sk in sorted(_SEARCH_SORT_KEYS, key=len, reverse=True):
@@ -295,7 +301,7 @@ def parse_search_args(raw_query: str):
             text = text[:m_num.start()].strip()
 
     top_n = max(1, min(top_n, 50))
-    return text, sort, top_n, page
+    return text, sort, top_n, page, search_type
 
 
 def get_event_text(event: dict[str, Any]) -> str:
@@ -494,7 +500,7 @@ def find_latest_pdf(dir_path: Path) -> Path | None:
     return max(pdfs, key=lambda p: p.stat().st_mtime)
 
 
-def run_search(query: str, sort: str = None, top_n: int = None, page: int = None) -> str:
+def run_search(query: str, sort: str = None, top_n: int = None, page: int = None, search_type: str = None) -> str:
     """查询本子信息（支持 ID 精确查询 或 关键词搜索），通过子进程调用 jmcomic。"""
     cmd = [PYTHON_EXE, str(SEARCH_SCRIPT), query]
     if sort:
@@ -503,6 +509,8 @@ def run_search(query: str, sort: str = None, top_n: int = None, page: int = None
         cmd += ["-n", str(top_n)]
     if page is not None and page > 1:
         cmd += ["--page", str(page)]
+    if search_type and search_type != "normal":
+        cmd += ["-t", search_type]
     log(f"running search: {' '.join(cmd)}")
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=45)
@@ -665,14 +673,16 @@ def onebot_handler():
             "📖 JMComic Bot 指令帮助\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             "🔍 /search <ID|关键词> [排序] [数量]\n"
-            "  /search <关键词> sort=排序 top=数量 page=页码\n"
+            "  /search <关键词> sort=排序 top=数量 page=页码 type=类型\n"
             "  查询本子信息。纯数字按ID精确查询，文字按关键词搜索。\n"
             "  排序: 收藏/最新/观看/长度 (默认: 收藏)\n"
-            "  数量: 旧格式 1-50 (默认20), 新格式 1-80\n"
+            "  类型: normal(默认)/author(作者)/tag(标签)\n"
+            "  数量: 旧格式 1-50, 新格式 1-80 (默认20)\n"
             "  示例:\n"
-            "    /search 350234               → ID精确查询\n"
-            "    /search 原神 最新 5           → 旧格式：发布时间排序，前5条\n"
-            "    /search 原神 sort=观看 top=10 → 新格式：观看排序，前10条\n"
+            "    /search 350234              → ID查询（可加 --brief 简洁模式）\n"
+            "    /search 原神 最新 5          → 旧格式\n"
+            "    /search 原神 sort=观看 top=10 page=2 → 第2页\n"
+            "    /search MANA type=author top=5 → 按作者搜索\n\n"
             "    /search 原神 sort=收藏 top=5 page=3 → 收藏排序，第3页\n\n"
             "📥 /download <ID> [-s|nosend]\n"
             "  下载指定本子并生成 PDF 文件。加 -s/nosend 仅存储不发送。\n"
@@ -695,11 +705,11 @@ def onebot_handler():
     log(f"/search match: {bool(search_match)}")
     if search_match:
         raw_query = search_match.group(1).strip()
-        query, sort, top_n, page = parse_search_args(raw_query)
-        log_usage(event.get("user_id"), event.get("group_id"), "search", f"query={query!r} sort={sort} top={top_n} page={page}")
-        log(f"received command: /search query={query!r} sort={sort} top={top_n} page={page} from user={event.get('user_id')}")
+        query, sort, top_n, page, search_type = parse_search_args(raw_query)
+        log_usage(event.get("user_id"), event.get("group_id"), "search", f"query={query!r} sort={sort} top={top_n} page={page} type={search_type}")
+        log(f"received command: /search query={query!r} sort={sort} top={top_n} page={page} type={search_type} from user={event.get('user_id')}")
         try:
-            result_text = run_search(query, sort=sort, top_n=top_n, page=page)
+            result_text = run_search(query, sort=sort, top_n=top_n, page=page, search_type=search_type)
             # 记录搜索结果中的本子
             log_album_from_search(result_text, source="search")
             reply_to_event(event, result_text)

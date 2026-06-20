@@ -34,19 +34,25 @@ DEFAULT_SORT = JmMagicConstants.ORDER_BY_LIKE  # 默认按收藏排序
 DEFAULT_TOP = 20  # 默认显示前 20 条
 
 
-def format_album_info(album) -> str:
+def format_album_info(album, brief: bool = False) -> str:
     """把 JmAlbumDetail 格式化为纯文本。"""
     lines = []
 
     lines.append(f"[{album.name}]")
     lines.append(f"JM{album.album_id}")
-    lines.append("")
 
     if album.authors:
         lines.append(f"作者: {', '.join(album.authors)}")
 
+    lines.append(f"总页数: {album.page_count}  观看: {album.views}  点赞: {album.likes}")
+
+    if brief:
+        if album.tags:
+            lines.append(f"标签: {', '.join(album.tags[:5])}")
+        lines.append(f"章节: {len(album.episode_list)} 个")
+        return "\n".join(lines)
+
     lines.append(f"发布: {album.pub_date}  |  更新: {album.update_date}")
-    lines.append(f"总页数: {album.page_count}  观看: {album.views}  点赞: {album.likes}  评论: {album.comment_count}")
     lines.append("")
 
     if album.tags:
@@ -68,23 +74,32 @@ def format_album_info(album) -> str:
     return "\n".join(lines)
 
 
-def format_search_results(page, keyword: str, sort_order: str, top_n: int, api_page: int = 1) -> str:
+def format_search_results(page, keyword: str, sort_order: str, top_n: int,
+                          api_page: int = 1, search_type: str = "normal") -> str:
     """把 JmSearchPage 格式化为搜索结果文本。"""
     sort_label = SORT_LABELS.get(sort_order, sort_order)
     total = page.total
     shown = min(len(page), top_n)
-    page_size = getattr(page, 'page_size', 80)
+
+    type_label = {"author": "作者", "tag": "标签"}.get(search_type, "")
 
     lines = []
     page_info = f"第{api_page}页" if api_page > 1 else ""
-    lines.append(f"搜索「{keyword}」共 {total} 个结果，按{sort_label}排序{page_info}，显示前 {shown} 个：")
+    lines.append(f"搜索「{keyword}」{type_label} 共 {total} 个结果，按{sort_label}排序{page_info}，显示前 {shown} 个：")
     lines.append("")
 
-    for i, (aid, title, tags) in enumerate(page.iter_id_title_tag()):
+    for i, (aid, info) in enumerate(page.content):
         if i >= top_n:
             break
-        tag_str = ", ".join(tags[:3]) if tags else ""
-        lines.append(f"JM{aid}  {title}")
+        title = info.get('name', '')
+        author = info.get('author', '')
+        tags_list = info.get('tags', []) or []
+        tag_str = ", ".join(tags_list[:3]) if tags_list else ""
+
+        line = f"JM{aid}  {title}"
+        if author and author != 'N/A':
+            line += f"  ✍️{author}"
+        lines.append(line)
         if tag_str:
             lines.append(f"  标签: {tag_str}")
 
@@ -132,6 +147,11 @@ def main():
                         help=f"显示前 N 个结果 (默认: {DEFAULT_TOP})")
     parser.add_argument("--page", type=int, default=1,
                         help="搜索结果的页码 (默认: 1)")
+    parser.add_argument("-t", "--type", type=str, default="normal",
+                        choices=["normal", "author", "tag"],
+                        help="搜索类型: normal/author/tag (默认: normal)")
+    parser.add_argument("--brief", action="store_true",
+                        help="ID 查询使用简洁模式")
     args = parser.parse_args()
 
     query = args.query
@@ -164,15 +184,21 @@ def main():
         if is_numeric:
             # 精确 ID 查询
             album = client.get_album_detail(query)
-            result = format_album_info(album)
+            result = format_album_info(album, brief=args.brief)
         else:
-            # 关键词搜索（带排序、相关性优化和分页）
+            # 关键词搜索（带排序、相关性优化、分页和搜索类型）
             search_query = build_search_query(query)
-            page = client.search_site(search_query, page=args.page, order_by=sort_order)
-            # 0 结果时回退：去掉 + 前缀，宽松匹配
-            if page.total == 0 and search_query != query:
-                page = client.search_site(query, page=args.page, order_by=sort_order)
-            result = format_search_results(page, query, sort_order, top_n, args.page)
+            search_type = args.type
+            if search_type == "author":
+                page = client.search_author(search_query, page=args.page, order_by=sort_order)
+            elif search_type == "tag":
+                page = client.search_tag(search_query, page=args.page, order_by=sort_order)
+            else:
+                page = client.search_site(search_query, page=args.page, order_by=sort_order)
+                # 0 结果时回退：去掉 + 前缀，宽松匹配
+                if page.total == 0 and search_query != query:
+                    page = client.search_site(query, page=args.page, order_by=sort_order)
+            result = format_search_results(page, query, sort_order, top_n, args.page, search_type)
 
     except Exception as e:
         sys.stdout = old_stdout
