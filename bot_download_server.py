@@ -30,6 +30,8 @@ _USAGE_LOG = _LOG_DIR / "usage.log"
 _ALBUM_LOG = _LOG_DIR / "albums.log"
 _CHAT_LOG_DIR = _LOG_DIR / "chat"
 _FAV_FILE = _LOG_DIR / "favorites.json"
+_PREFS_FILE = _LOG_DIR / "preferences.json"
+_RATING_FILE = _LOG_DIR / "ratings.json"
 
 # JM 地址常量（模块级导入，避免 Flask 线程中 asyncio 冲突）
 _JM_WEB_URL = "https://jmcomicgo(dot)org"
@@ -66,6 +68,10 @@ COMMAND_INFO_RE = re.compile(r"/info\s+(\d{6,})", re.IGNORECASE)
 COMMAND_RECENT_RE = re.compile(r"/recent", re.IGNORECASE)
 COMMAND_RANDOM_RE = re.compile(r"/random", re.IGNORECASE)
 COMMAND_FAV_RE = re.compile(r"/fav\s*(add|list|remove|del)?\s*(\d{6,})?", re.IGNORECASE)
+COMMAND_SYSINFO_RE = re.compile(r"/sysinfo", re.IGNORECASE)
+COMMAND_PREFS_RE = re.compile(r"/prefs(?:\s+set\s+sort=(\S+))?(?:\s+top=(\d+))?", re.IGNORECASE)
+COMMAND_COVER_RE = re.compile(r"/cover\s+(\d{6,})", re.IGNORECASE)
+COMMAND_RATING_RE = re.compile(r"/rating\s+(\d{6,})\s+(\d|10)", re.IGNORECASE)
 # 自然语言中的车号: JM350234 或 纯6+位数字
 _CAR_NUMBER_RE = re.compile(r'(?:JM)?(\d{6,})\b')
 
@@ -774,7 +780,7 @@ def onebot_handler():
     log(f"msg={msg!r}")
 
     # 频率限制检查（仅对命令生效）
-    is_command = any(r.search(msg) for r in [COMMAND_PING_RE, COMMAND_JMURL_RE, COMMAND_HELP_RE, COMMAND_SE_RE, COMMAND_DL_RE, COMMAND_STATS_RE, COMMAND_TOP_RE, COMMAND_INFO_RE, COMMAND_RECENT_RE, COMMAND_RANDOM_RE, COMMAND_FAV_RE])
+    is_command = any(r.search(msg) for r in [COMMAND_PING_RE, COMMAND_JMURL_RE, COMMAND_HELP_RE, COMMAND_SE_RE, COMMAND_DL_RE, COMMAND_STATS_RE, COMMAND_TOP_RE, COMMAND_INFO_RE, COMMAND_RECENT_RE, COMMAND_RANDOM_RE, COMMAND_FAV_RE, COMMAND_SYSINFO_RE, COMMAND_PREFS_RE, COMMAND_COVER_RE, COMMAND_RATING_RE])
     if is_command and not _check_rate_limit(user_id, group_id):
         log(f"rate limited: user={user_id} group={group_id}")
         return jsonify({"ok": False, "error": "rate limited"}), 429
@@ -903,6 +909,19 @@ for i, (aid, title) in enumerate(page):
     if search_match:
         raw_query = search_match.group(1).strip()
         query, sort, top_n, page, search_type = parse_search_args(raw_query)
+        # 自动应用用户偏好（如果用户没有显式指定）
+        if sort is None and top_n == 20 and page == 1 and search_type is None:
+            try:
+                prefs = {}
+                if _PREFS_FILE.exists():
+                    prefs = json.loads(_PREFS_FILE.read_text(encoding="utf-8"))
+                up = prefs.get(str(event.get("user_id")), {})
+                if up.get("sort"):
+                    sort = up["sort"]
+                if up.get("top"):
+                    top_n = up["top"]
+            except Exception:
+                pass
         log_usage(event.get("user_id"), event.get("group_id"), "search", f"query={query!r} sort={sort} top={top_n} page={page} type={search_type}")
         log(f"received command: /search query={query!r} sort={sort} top={top_n} page={page} type={search_type} from user={event.get('user_id')}")
         try:
@@ -1027,6 +1046,111 @@ print(f"JM{{album[0]}}  {{album[1]}}")
                 else:
                     text = "暂无收藏"
                 reply_to_event(event, text)
+        except Exception as e:
+            reply_to_event(event, f"❌ {e}")
+        return jsonify({"ok": True})
+
+    # /sysinfo - 系统信息
+    if COMMAND_SYSINFO_RE.search(msg):
+        log("sysinfo requested")
+        log_usage(event.get("user_id"), event.get("group_id"), "sysinfo")
+        try:
+            import platform, psutil
+            from datetime import datetime
+            cpu = psutil.cpu_percent(interval=0.5)
+            mem = psutil.virtual_memory()
+            disk = psutil.disk_usage("/")
+            boot = datetime.fromtimestamp(psutil.boot_time()).strftime("%m-%d %H:%M")
+            info = (
+                "🖥️ 系统信息\n━━━━━━━━━━━━━━━━━━\n\n"
+                f"🐍 Python: {sys.version.split()[0]}\n"
+                f"💻 OS: {platform.system()} {platform.release()}\n"
+                f"🕐 运行时间: {boot} 起\n\n"
+                f"📊 CPU: {cpu}%\n"
+                f"🧠 内存: {mem.percent}% ({mem.used//1024//1024}MB/{mem.total//1024//1024}MB)\n"
+                f"💾 磁盘: {disk.percent}% ({disk.free//1024//1024//1024}GB 可用)\n\n"
+                f"📦 jmcomic: 2.7.0\n"
+                f"🔄 waitress threads: {os.getenv('WORKER_THREADS', '4')}\n"
+                f"📥 PDF 文件: {len(list(OUTPUT_DIR.glob('[JM*]*.pdf')))} 个"
+            )
+            reply_to_event(event, info)
+        except ImportError:
+            reply_to_event(event, "❌ 缺少 psutil 模块")
+        except Exception as e:
+            reply_to_event(event, f"❌ {e}")
+        return jsonify({"ok": True})
+
+    # /prefs [set sort=xxx top=xx]
+    prefs_match = COMMAND_PREFS_RE.search(msg)
+    if prefs_match:
+        sort_val = prefs_match.group(1)
+        top_val = prefs_match.group(2)
+        log(f"prefs: sort={sort_val} top={top_val}")
+        log_usage(event.get("user_id"), event.get("group_id"), "prefs", f"sort={sort_val} top={top_val}")
+        user_key = str(event.get("user_id"))
+        try:
+            prefs = {}
+            if _PREFS_FILE.exists():
+                prefs = json.loads(_PREFS_FILE.read_text(encoding="utf-8"))
+            if sort_val or top_val:
+                prefs.setdefault(user_key, {})
+                if sort_val and sort_val in _SEARCH_SORT_KEYS:
+                    prefs[user_key]["sort"] = sort_val
+                if top_val:
+                    prefs[user_key]["top"] = int(top_val)
+                _PREFS_FILE.write_text(json.dumps(prefs, ensure_ascii=False, indent=2), encoding="utf-8")
+                cur = prefs.get(user_key, {})
+                reply_to_event(event, f"⚙️ 偏好已保存: sort={cur.get('sort','默认')} top={cur.get('top','20')}")
+            else:
+                cur = prefs.get(user_key, {})
+                if cur:
+                    reply_to_event(event, f"⚙️ 你的偏好: sort={cur.get('sort','默认')} top={cur.get('top','20')}")
+                else:
+                    reply_to_event(event, "⚙️ 未设置偏好，使用 /prefs set sort=最新 top=10 设置")
+        except Exception as e:
+            reply_to_event(event, f"❌ {e}")
+        return jsonify({"ok": True})
+
+    # /cover <ID> - 封面预览
+    cover_match = COMMAND_COVER_RE.search(msg)
+    if cover_match:
+        album_id = cover_match.group(1)
+        log(f"cover requested: {album_id}")
+        log_usage(event.get("user_id"), event.get("group_id"), "cover", album_id)
+        cover_url = f"https://cdn-msp.jmapiproxy1.cc/media/photos/{album_id}/00001.webp"
+        try:
+            # 发送图片消息
+            if event.get("message_type") == "group":
+                send_onebot_api("send_group_msg", {
+                    "group_id": event.get("group_id"),
+                    "message": f"[CQ:image,file={cover_url},type=show,id=40000]\nJM{album_id} 封面",
+                })
+            else:
+                send_onebot_api("send_private_msg", {
+                    "user_id": event.get("user_id"),
+                    "message": f"[CQ:image,file={cover_url},type=show,id=40000]\nJM{album_id} 封面",
+                })
+            reply_to_event(event, f"🖼️ JM{album_id} 封面已发送")
+        except Exception as e:
+            reply_to_event(event, f"❌ 封面发送失败: {e}")
+        return jsonify({"ok": True})
+
+    # /rating <ID> <1-10>
+    rating_match = COMMAND_RATING_RE.search(msg)
+    if rating_match:
+        album_id = rating_match.group(1)
+        score = int(rating_match.group(2))
+        log(f"rating: {album_id} {score}")
+        log_usage(event.get("user_id"), event.get("group_id"), "rating", f"{album_id}={score}")
+        try:
+            ratings = {}
+            if _RATING_FILE.exists():
+                ratings = json.loads(_RATING_FILE.read_text(encoding="utf-8"))
+            ratings.setdefault(album_id, [])
+            ratings[album_id].append(score)
+            avg = sum(ratings[album_id]) / len(ratings[album_id])
+            _RATING_FILE.write_text(json.dumps(ratings, ensure_ascii=False, indent=2), encoding="utf-8")
+            reply_to_event(event, f"⭐ JM{album_id} 评分: {score}/10 (平均 {avg:.1f}, {len(ratings[album_id])}人)")
         except Exception as e:
             reply_to_event(event, f"❌ {e}")
         return jsonify({"ok": True})
