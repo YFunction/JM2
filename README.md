@@ -1,5 +1,5 @@
 # JM2 — JMComic QQ Bot（Linux 版）
-
+[text](my_pdf_output)
 基于 [JMComic-Crawler-Python](https://github.com/hect0x7/JMComic-Crawler-Python) 构建的 QQ 群机器人，
 通过 [NapCat](https://github.com/NapNeko/NapCatQQ)（OneBot v11 协议）接入 QQ，
 提供禁漫本子搜索、详情查询、下载转 PDF 等功能。
