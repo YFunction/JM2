@@ -37,6 +37,61 @@ _RATING_FILE = _LOG_DIR / "ratings.json"
 _search_context: dict = {}  # {group_id: {query, sort, top_n, page, ids}}
 _search_context_lock = threading.Lock()
 
+# ── NLP 自然语言解析（纯正则，零依赖）──
+
+def _nlp_parse(text: str):
+    """纯正则 NLP：意图分类 + 槽位提取。"""
+    if len(text) < 2:
+        return None
+
+    # 意图匹配（加权）
+    _INTENTS = [
+        ("search", [r"查[一下]?", r"搜[索]?", r"找[一下]?", r"有没有", r"看看", r"想看", r"[给来]个"], 1.0),
+        ("download", [r"下载", r"下[一个]?", r"来[一]?份", r"要这个"], 1.0),
+        ("random", [r"推荐", r"[随来]一个", r"随便", r"有什么好"], 1.0),
+        ("top", [r"排行", r"热门", r"最火", r"[日周月]榜"], 1.0),
+        ("info", [r"详情", r"信息", r"介绍"], 0.8),
+    ]
+    scores = {}
+    for intent, patterns, w in _INTENTS:
+        for p in patterns:
+            if re.search(p, text):
+                scores[intent] = scores.get(intent, 0) + w
+    if not scores:
+        return None
+    best = max(scores, key=scores.get)
+
+    # 提取车号
+    car = re.search(r'(?:JM)?(\d{6,})', text)
+    album_id = car.group(1) if car else None
+
+    # 提取排序
+    sort = None
+    for sk, pats in [("最新", [r"最新", r"新出", r"最近", r"刚出"]),
+                      ("收藏", [r"收藏", r"点赞", r"喜欢", r"最火", r"热门"]),
+                      ("观看", [r"观看", r"看过", r"热度"]),
+                      ("长度", [r"最长", r"页数"])]:
+        if any(re.search(p, text) for p in pats):
+            sort = sk
+            break
+
+    # 提取数量
+    top_n = 20
+    nm = re.search(r'(\d+)\s*[个条张]', text)
+    if nm:
+        top_n = min(int(nm.group(1)), 50)
+
+    # 提取搜索关键词
+    query = text
+    # 去掉意图词、排序词、语气词
+    noise = r"有没有|帮我|查一下|搜索|找一下|看看|来个|想看|推荐|最新|新出|最近|刚出|收藏|点赞|喜欢|最火|热门|观看|看过|热度|最长|页数|下载|一个|一下|本子|漫画|的|什么"
+    for w in noise.split("|"):
+        query = re.sub(w, "", query)
+    query = re.sub(r'\s+', ' ', query).strip() or text
+
+    return {"intent": best, "album_id": album_id, "query": query,
+            "sort": sort, "top_n": top_n, "score": scores[best]}
+
 # JM 地址常量（模块级导入，避免 Flask 线程中 asyncio 冲突）
 _JM_WEB_URL = "https://jmcomicgo(dot)org"
 _JM_REDIRECT_URL = "https://jm365(dot)work/3YeBdF"
@@ -1261,6 +1316,51 @@ print(f"JM{{album[0]}}  {{album[1]}}")
             else:
                 reply_to_event(event, "❌ 序号超出范围")
         return jsonify({"ok": True})
+
+    # ── NLP 自然语言兜底 ──
+    try:
+        parsed = _nlp_parse(msg)
+        if parsed and parsed.get("score", 0) >= 1.0:
+            intent = parsed["intent"]
+            log(f"nlp: {parsed}")
+            if intent == "search":
+                q = parsed["album_id"] or parsed["query"]
+                rt = run_search(q, sort=parsed.get("sort"), top_n=parsed.get("top_n", 20))
+                reply_to_event(event, f"🤖 {rt}")
+            elif intent == "download" and parsed.get("album_id"):
+                def _nlp_dl():
+                    try:
+                        with lock:
+                            r, p = run_download(parsed["album_id"])
+                        reply_to_event(event, r, file_path=p)
+                    except Exception as e:
+                        reply_to_event(event, f"❌ {e}")
+                threading.Thread(target=_nlp_dl, daemon=True).start()
+            elif intent == "random":
+                from random import choice
+                cmd = [PYTHON_EXE, "-c",
+                       "from jmcomic import JmOption;"+
+                       "o=JmOption.default();c=o.build_jm_client();"+
+                       "import random;"+
+                       "p=c.day_ranking(page=random.randint(1,10));"+
+                       "a=random.choice(list(p.iter_id_title()));"+
+                       "print(f'JM{a[0]} {a[1]}')"]
+                proc = _run_subprocess_with_retry(cmd, timeout=20)
+                reply_to_event(event, f"🎲 {proc.stdout.strip()}")
+            elif intent == "top":
+                cmd = [PYTHON_EXE, "-c",
+                       "from jmcomic import JmOption;"+
+                       "o=JmOption.default();c=o.build_jm_client();"+
+                       "p=c.day_ranking(page=1);"+
+                       "print('\\n'.join(f'JM{a} {t}' for a,t in list(p.iter_id_title())[:5]))"]
+                proc = _run_subprocess_with_retry(cmd, timeout=20)
+                reply_to_event(event, f"🔝 日榜 TOP5\n{proc.stdout.strip()}")
+            elif intent == "info" and parsed.get("album_id"):
+                rt = run_search(parsed["album_id"])
+                reply_to_event(event, rt.split("\n")[0] if rt else "未找到")
+            return jsonify({"ok": True})
+    except Exception as e:
+        log(f"nlp error: {e}")
 
     log(f"no command matched for msg={msg!r}")
     return jsonify({"ok": True})
