@@ -68,14 +68,16 @@ def format_album_info(album) -> str:
     return "\n".join(lines)
 
 
-def format_search_results(page, keyword: str, sort_order: str, top_n: int) -> str:
+def format_search_results(page, keyword: str, sort_order: str, top_n: int, api_page: int = 1) -> str:
     """把 JmSearchPage 格式化为搜索结果文本。"""
     sort_label = SORT_LABELS.get(sort_order, sort_order)
     total = page.total
     shown = min(len(page), top_n)
+    page_size = getattr(page, 'page_size', 80)
 
     lines = []
-    lines.append(f"搜索「{keyword}」共 {total} 个结果，按{sort_label}排序，显示前 {shown} 个：")
+    page_info = f"第{api_page}页" if api_page > 1 else ""
+    lines.append(f"搜索「{keyword}」共 {total} 个结果，按{sort_label}排序{page_info}，显示前 {shown} 个：")
     lines.append("")
 
     for i, (aid, title, tags) in enumerate(page.iter_id_title_tag()):
@@ -128,6 +130,8 @@ def main():
                         help=f"排序方式: 收藏/最新/观看/长度 (默认: 收藏)")
     parser.add_argument("-n", "--top", type=int, default=DEFAULT_TOP,
                         help=f"显示前 N 个结果 (默认: {DEFAULT_TOP})")
+    parser.add_argument("--page", type=int, default=1,
+                        help="搜索结果的页码 (默认: 1)")
     args = parser.parse_args()
 
     query = args.query
@@ -162,13 +166,13 @@ def main():
             album = client.get_album_detail(query)
             result = format_album_info(album)
         else:
-            # 关键词搜索（带排序和相关性优化）
+            # 关键词搜索（带排序、相关性优化和分页）
             search_query = build_search_query(query)
-            page = client.search_site(search_query, page=1, order_by=sort_order)
+            page = client.search_site(search_query, page=args.page, order_by=sort_order)
             # 0 结果时回退：去掉 + 前缀，宽松匹配
             if page.total == 0 and search_query != query:
-                page = client.search_site(query, page=1, order_by=sort_order)
-            result = format_search_results(page, query, sort_order, top_n)
+                page = client.search_site(query, page=args.page, order_by=sort_order)
+            result = format_search_results(page, query, sort_order, top_n, args.page)
 
     except Exception as e:
         sys.stdout = old_stdout

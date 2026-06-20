@@ -9,34 +9,42 @@
 | 命令 | 说明 | 示例 |
 |------|------|------|
 | `/search <ID>` | 按车号精确查询本子详情 | `/search 350234` |
-| `/search <关键词> [排序] [数量]` | 关键词搜索，多词自动相关性匹配 | `/search 无修正 收藏 20` |
-| `/download <ID>` | 下载本子并生成 PDF | `/download 350234` |
+| `/search <关键词> [参数...]` | 关键词搜索，支持排序/分页 | 见下方 |
+| `/download <ID>` | 下载本子并发送 PDF | `/download 350234` |
+| `/download <ID> -s` | 下载但不发送（仅存储） | `/download 350234 -s` |
 | `/jmurl` | 获取禁漫地址（防和谐格式） | `/jmurl` |
 | `/ping` | Bot 存活检测 | `/ping` |
 | `/help` | 显示完整帮助 | `/help` |
 
-### 搜索排序参数
+### 搜索参数
 
-在 `/search` 关键词后可选指定排序和数量（默认按收藏排序、显示前 20 条）：
+支持两种格式：
 
-| 参数 | 含义 |
-|------|------|
-| `收藏` / `最新` / `观看` / `长度` | 排序方式 |
-| 数字（1-50） | 显示条数 |
-
-示例：
+**旧格式（位置参数）**：
 ```
-/search 无修正              # 收藏排序，前 20 条
-/search 无修正 最新 5        # 发布时间排序，前 5 条
-/search 无修正 观看 10       # 观看次数排序，前 10 条
+/search 原神 最新 10       → sort=最新, top=10
+/search 无修正 5            → top=5
 ```
+
+**新格式（key=value，支持分页）**：
+```
+/search 原神 sort=观看 top=10 page=2
+```
+
+| 参数 | 说明 | 默认值 |
+|------|------|--------|
+| `sort=` | 排序：收藏/最新/观看/长度 | `收藏` |
+| `top=` 或 `page_size=` | 每页条数 | `20` |
+| `page=` | 页码（翻页用） | `1` |
 
 ### 其他特性
 
-- **松散命令匹配**：支持 `@bot /search xxx` 或 `帮我查一下 /search xxx` 等自然语言
+- **松散命令匹配**：支持 `@bot /search xxx` 或 `帮我查一下 /search xxx`
 - **相关性搜索**：多关键词自动转为 `+词1 +词2`，大幅提升搜索精度
 - **1 分 50 秒自动撤回**：每条 Bot 消息在发送后 110 秒自动删除
-- **使用日志**：`logs/usage.log` 记录所有命令，`logs/albums.log` 记录访问过的本子
+- **后台静默下载**：自动从 albums.log 中下载未下载过的本子，限速去重
+- **聊天记录**：按群/私聊分文件保存到 `logs/chat/`
+- **使用日志**：`logs/usage.log` + `logs/albums.log`（含标题和标签）
 
 ## 环境要求
 
@@ -49,47 +57,27 @@
 ### 1. 安装依赖
 
 ```bash
-# 安装 Python 包
 pip install jmcomic flask requests img2pdf
-
-# 或从源码安装 jmcomic
-cd JM2
-pip install -e . --no-build-isolation
+cd JM2 && pip install -e . --no-build-isolation
 ```
 
 ### 2. 安装 NapCat
 
 ```bash
-# 运行安装脚本
 bash napcat.sh
 ```
 
 ### 3. 启动 NapCat
 
 ```bash
-# 虚拟桌面 + QQ 无沙箱启动
 screen -dmS napcat bash -c "xvfb-run -a /opt/QQ/qq --no-sandbox"
-
-# 首次启动需扫码登录，之后可用 -q 快速登录
-screen -dmS napcat bash -c "xvfb-run -a /opt/QQ/qq --no-sandbox -q QQ号"
+# 首次需扫码登录，之后可用 -q QQ号 快速登录
 ```
 
 ### 4. 配置 OneBot
 
-浏览器打开 NapCat WebUI：`http://127.0.0.1:6099/webui?token=<token>`
-
-- 启用 **HTTP 服务**（端口 3000）
-- 添加 **HTTP 上报**，地址设为 `http://127.0.0.1:9001/onebot`
-
-> 或直接编辑配置文件 `onebot11_<QQ号>.json`：
-> ```json
-> {
->   "network": {
->     "httpServers": [{"enable": true, "host": "0.0.0.0", "port": 3000}],
->     "httpClients": [{"enable": true, "url": "http://127.0.0.1:9001/onebot"}]
->   }
-> }
-> ```
+NapCat WebUI 中启用 HTTP 服务（端口 3000）并添加 HTTP 上报到 `http://127.0.0.1:9001/onebot`。
+或直接编辑 `onebot11_<QQ号>.json` 配置文件。
 
 ### 5. 启动 Bot
 
@@ -98,7 +86,7 @@ cd JM2
 PYTHONUNBUFFERED=1 nohup python3 -u bot_download_server.py > /tmp/bot.log 2>&1 &
 ```
 
-Bot 默认监听 `0.0.0.0:9001`，通过环境变量可配置：
+## 环境变量
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
@@ -112,32 +100,23 @@ Bot 默认监听 `0.0.0.0:9001`，通过环境变量可配置：
 ```
 JM2/
 ├── bot_download_server.py   # QQ Bot 主程序
-├── search_album_info.py     # 搜索脚本（ID 查询 / 关键词搜索）
-├── download_album_to_pdf.py # 下载 + PDF 生成脚本
+├── search_album_info.py     # 搜索脚本
+├── download_album_to_pdf.py # 下载 + PDF 生成
 ├── napcat.sh                # NapCat 安装脚本
-├── logs/                    # 运行日志
+├── logs/
 │   ├── usage.log            # 命令使用记录
-│   └── albums.log           # 本子访问记录
-├── src/jmcomic/             # jmcomic 核心库（上游）
-│   ├── api.py               # 下载 API
-│   ├── jm_client_impl.py    # 移动端 / 网页端客户端
-│   ├── jm_plugin.py         # 插件（img2pdf 等）
-│   └── ...
+│   ├── albums.log           # 本子访问记录（含标题+标签）
+│   ├── downloaded.txt       # 已下载 ID
+│   └── chat/                # 聊天记录（分群/私聊）
+├── src/jmcomic/             # jmcomic 核心库
 └── README.md
 ```
 
 ## 致谢
 
-- [JMComic-Crawler-Python](https://github.com/hect0x7/JMComic-Crawler-Python) — 禁漫 Python API
-- [NapCat](https://github.com/NapNeko/NapCatQQ) — QQ Bot 框架
+- [JMComic-Crawler-Python](https://github.com/hect0x7/JMComic-Crawler-Python)
+- [NapCat](https://github.com/NapNeko/NapCatQQ)
 
 ## 免责声明
 
-<iframe src="//player.bilibili.com/player.html?isOutside=true&aid=955305260&bvid=BV1Ts4y1F7r3&cid=1180189086&p=1" scrolling="no" border="0" frameborder="no" framespacing="0" allowfullscreen="true"></iframe>
-
-![](https://www.bilibili.com/video/BV1Ts4y1F7r3/?spm_id_from=333.337.search-card.all.click)
-
 本项目仅供学习交流使用，请遵守相关法律法规，合理使用。
-不要一次性爬取太多本子，请珍爱 JM 服务器。
-
-

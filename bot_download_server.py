@@ -5,6 +5,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +26,7 @@ SEARCH_SCRIPT = Path(__file__).resolve().parent / "search_album_info.py"
 _LOG_DIR = Path(__file__).resolve().parent / "logs"
 _USAGE_LOG = _LOG_DIR / "usage.log"
 _ALBUM_LOG = _LOG_DIR / "albums.log"
+_CHAT_LOG_DIR = _LOG_DIR / "chat"
 
 # JM 地址常量（模块级导入，避免 Flask 线程中 asyncio 冲突）
 _JM_WEB_URL = "https://jmcomicgo(dot)org"
@@ -32,6 +34,13 @@ _JM_REDIRECT_URL = "https://jm365(dot)work/3YeBdF"
 
 lock = threading.Lock()
 COMMAND_DL_RE = re.compile(r"/download\s+(\d{6,})", re.IGNORECASE)
+# /download 后可选 -s / nosend / --store 表示仅存储不发送
+COMMAND_DL_NOSEND_RE = re.compile(r"/download\s+(\d{6,})\b.*?(-s|nosend|--store)", re.IGNORECASE)
+
+# 已下载记录
+_DOWNLOADED_LOG = _LOG_DIR / "downloaded.txt"
+# 后台下载间隔（秒）
+_BG_DOWNLOAD_INTERVAL = 30
 COMMAND_SE_RE = re.compile(r"/search\s+(.+)", re.IGNORECASE)
 COMMAND_PING_RE = re.compile(r"/ping", re.IGNORECASE)
 COMMAND_HELP_RE = re.compile(r"/help", re.IGNORECASE)
@@ -51,6 +60,120 @@ def log(msg: str) -> None:
 
 def _ensure_log_dir() -> None:
     _LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def log_chat(event: dict[str, Any], text: str) -> None:
+    """将收到的聊天消息按群/私聊分文件保存。"""
+    _CHAT_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    msg_type = event.get("message_type", "unknown")
+    chat_id = event.get("group_id") or event.get("user_id") or "unknown"
+    sender_id = event.get("user_id") or "unknown"
+    # 尝试获取发送者昵称
+    sender_name = ""
+    sender_info = event.get("sender", {})
+    if isinstance(sender_info, dict):
+        sender_name = sender_info.get("nickname") or sender_info.get("card") or ""
+
+    prefix = "group" if msg_type == "group" else "private"
+    filename = f"{prefix}_{chat_id}.log"
+    filepath = _CHAT_LOG_DIR / filename
+
+    # 格式化为可读的单行（多行消息用 ⏎ 连接）
+    text_one_line = text.replace("\n", " ⏎ ")
+    sender_display = f"{sender_id}"
+    if sender_name:
+        sender_display += f"({sender_name})"
+
+    line = f"[{ts}] {sender_display}: {text_one_line}"
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+# ── 后台下载器 ──
+
+def _load_downloaded_ids() -> set:
+    """加载已下载的本子 ID 集合（从 downloaded.txt 和已有 PDF 文件）。"""
+    ids = set()
+    # 1. 从 downloaded.txt 读取
+    if _DOWNLOADED_LOG.exists():
+        with open(_DOWNLOADED_LOG, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line and line.isdigit():
+                    ids.add(line)
+    # 2. 从已有 PDF 文件名提取 ID
+    for pdf in OUTPUT_DIR.glob("[JM*]*.pdf"):
+        m = re.match(r'\[JM(\d+)\]', pdf.name)
+        if m:
+            ids.add(m.group(1))
+    return ids
+
+
+def _mark_downloaded(album_id: str) -> None:
+    """标记本子为已下载。"""
+    _ensure_log_dir()
+    with open(_DOWNLOADED_LOG, "a", encoding="utf-8") as f:
+        f.write(album_id + "\n")
+
+
+def _get_pending_albums() -> list[str]:
+    """从 albums.log 中提取尚未下载的本子 ID（去重，按出现顺序）。"""
+    if not _ALBUM_LOG.exists():
+        return []
+    downloaded = _load_downloaded_ids()
+    seen = set()
+    pending = []
+    with open(_ALBUM_LOG, "r", encoding="utf-8") as f:
+        for line in f:
+            # 格式: [时间] JM123456 | ...
+            m = re.search(r'JM(\d{6,})', line)
+            if m:
+                aid = m.group(1)
+                if aid not in downloaded and aid not in seen:
+                    seen.add(aid)
+                    pending.append(aid)
+    return pending
+
+
+def _background_downloader() -> None:
+    """后台线程：静默下载 albums.log 中未下载过的本子。"""
+    log("background downloader started")
+    while True:
+        try:
+            pending = _get_pending_albums()
+            if pending:
+                log(f"background: {len(pending)} pending albums to download")
+                for album_id in pending:
+                    # 再次检查（可能被用户抢先下载了）
+                    if album_id in _load_downloaded_ids():
+                        continue
+                    log(f"background: downloading JM{album_id}")
+                    try:
+                        with lock:
+                            result_text, pdf_path = run_download(album_id, keep_existing=True)
+                        if pdf_path and pdf_path.is_file():
+                            _mark_downloaded(album_id)
+                            log(f"background: JM{album_id} done")
+                        else:
+                            log(f"background: JM{album_id} no pdf generated")
+                    except Exception as e:
+                        log(f"background: JM{album_id} failed: {e}")
+                    # 限速间隔
+                    time.sleep(_BG_DOWNLOAD_INTERVAL)
+            else:
+                log("background: no pending albums, sleeping 60s")
+        except Exception as e:
+            log(f"background downloader error: {e}")
+        time.sleep(60)
+
+
+def start_background_downloader() -> None:
+    """启动后台下载线程。"""
+    t = threading.Thread(target=_background_downloader, daemon=True, name="bg-downloader")
+    t.start()
+    log("background downloader thread started")
 
 
 def log_usage(user_id, group_id, command: str, detail: str = "") -> None:
@@ -79,12 +202,16 @@ def log_album(album_id: str, title: str, tags: str = "", source: str = "search")
 
 
 def log_album_from_search(stdout: str, source: str = "search") -> None:
-    """从搜索脚本的 stdout 中提取 JM ID 和标题，写入 album 日志。"""
-    # 格式1: 关键词搜索结果 — "JM123456  标题..."
-    for m in re.finditer(r'JM(\d{6,})\s{2,}(.+?)(?:\s{2,}|$)', stdout):
-        log_album(m.group(1), m.group(2).strip(), source=source)
-    # 格式2: ID 精确查询 — "[标题]\nJM123456"
-    for m in re.finditer(r'\[([^\]]+)\]\nJM(\d{6,})', stdout):
+    """从搜索脚本的 stdout 中提取 JM ID、标题和标签，写入 album 日志。"""
+    # 格式1: 关键词搜索结果 — 行首 "JM123456  标题 [tag] [tag] ..."
+    for m in re.finditer(r'^JM(\d{6,})\s{2,}(.+)$', stdout, re.MULTILINE):
+        full_text = m.group(2).strip()
+        # 提取行末的标签（所有 [...] 括号内容）
+        tag_list = re.findall(r'\[([^\]]+)\]', full_text)
+        tags = ", ".join(tag_list) if tag_list else ""
+        log_album(m.group(1), full_text, tags=tags, source=source)
+    # 格式2: ID 精确查询 — 行首 "[标题]" 紧接着下一行行首 "JM123456"
+    for m in re.finditer(r'^\[([^\]]+)\]\nJM(\d{6,})', stdout, re.MULTILINE):
         log_album(m.group(2), m.group(1).strip(), source=source)
 
 
@@ -109,21 +236,50 @@ _SEARCH_SORT_KEYS = ['发布时间', '观看次数', '收藏', '点赞', '喜欢
 
 def parse_search_args(raw_query: str):
     """
-    从搜索指令中解析 关键词、排序方式、显示数量。
+    从搜索指令中解析 关键词、排序方式、显示数量、页码。
 
-    示例:
-      "无修正"              → ("无修正", None, 20)
-      "无修正 最新 10"      → ("无修正", "最新", 10)
-      "无修正 观看 5"       → ("无修正", "观看", 5)
-      "无修正 收藏"         → ("无修正", "收藏", 20)
-      "无修正 15"           → ("无修正", None, 15)
-      "关键词 带 空格 最新 8" → ("关键词 带 空格", "最新", 8)
+    支持两种格式:
+      旧格式: "无修正 最新 10"         → 位置参数
+      新格式: "无修正 sort=最新 top=20 page=2" → key=value 参数
+
+    返回: (query, sort, top_n, page)
     """
     text = raw_query.strip()
     sort = None
     top_n = 20
+    page = 1
 
-    # 尝试从末尾提取 "排序词 [数字]"  — 长词优先匹配
+    # ── 新格式: key=value ──
+    kv_pattern = re.compile(r'\b(sort|top|page_size|page)=(\S+)', re.IGNORECASE)
+    kv_found = list(kv_pattern.finditer(text))
+    if kv_found:
+        for m in kv_found:
+            key = m.group(1).lower()
+            val = m.group(2)
+            if key == 'sort':
+                for sk in _SEARCH_SORT_KEYS:
+                    if sk == val:
+                        sort = sk
+                        break
+                if sort is None:
+                    log(f"unknown sort value: {val}")
+            elif key in ('top', 'page_size'):
+                try:
+                    top_n = int(val)
+                except ValueError:
+                    pass
+            elif key == 'page':
+                try:
+                    page = int(val)
+                except ValueError:
+                    pass
+        # 移除所有 kv 参数，剩余为关键词
+        text = kv_pattern.sub('', text).strip()
+        top_n = max(1, min(top_n, 80))   # 每页最多 80
+        page = max(1, min(page, 1000))   # 页码 1-1000
+        return text, sort, top_n, page
+
+    # ── 旧格式: 位置参数 ──
     for sk in sorted(_SEARCH_SORT_KEYS, key=len, reverse=True):
         m = re.search(rf'\s+{re.escape(sk)}(?:\s+(\d{{1,3}}))?\s*$', text)
         if m:
@@ -133,13 +289,13 @@ def parse_search_args(raw_query: str):
             text = text[:m.start()].strip()
             break
     else:
-        # 没有排序词，尝试匹配末尾纯数字
         m_num = re.search(r'\s+(\d{1,3})\s*$', text)
         if m_num:
             top_n = int(m_num.group(1))
             text = text[:m_num.start()].strip()
 
-    return text, sort, min(top_n, 50)  # 最多 50 条
+    top_n = max(1, min(top_n, 50))
+    return text, sort, top_n, page
 
 
 def get_event_text(event: dict[str, Any]) -> str:
@@ -338,13 +494,15 @@ def find_latest_pdf(dir_path: Path) -> Path | None:
     return max(pdfs, key=lambda p: p.stat().st_mtime)
 
 
-def run_search(query: str, sort: str = None, top_n: int = None) -> str:
+def run_search(query: str, sort: str = None, top_n: int = None, page: int = None) -> str:
     """查询本子信息（支持 ID 精确查询 或 关键词搜索），通过子进程调用 jmcomic。"""
     cmd = [PYTHON_EXE, str(SEARCH_SCRIPT), query]
     if sort:
         cmd += ["-s", sort]
     if top_n is not None:
         cmd += ["-n", str(top_n)]
+    if page is not None and page > 1:
+        cmd += ["--page", str(page)]
     log(f"running search: {' '.join(cmd)}")
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=45)
@@ -380,15 +538,17 @@ def run_search(query: str, sort: str = None, top_n: int = None) -> str:
     return result or "(查询返回空)"
 
 
-def run_download(album_id: str) -> tuple[str, Path | None]:
+def run_download(album_id: str, keep_existing: bool = False) -> tuple[str, Path | None]:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     # 删除旧的 PDF 文件，避免 find_latest_pdf 返回过期结果
-    for old_pdf in OUTPUT_DIR.glob("*.pdf"):
-        try:
-            old_pdf.unlink()
-            log(f"cleaned old pdf: {old_pdf.name}")
-        except Exception as e:
-            log(f"failed to clean old pdf {old_pdf.name}: {e}")
+    # keep_existing=True 时跳过清理（用于后台批量下载）
+    if not keep_existing:
+        for old_pdf in OUTPUT_DIR.glob("*.pdf"):
+            try:
+                old_pdf.unlink()
+                log(f"cleaned old pdf: {old_pdf.name}")
+            except Exception as e:
+                log(f"failed to clean old pdf {old_pdf.name}: {e}")
     cmd = [PYTHON_EXE, str(SCRIPT_PATH), album_id, "-o", str(OUTPUT_DIR)]
     log(f"running: {' '.join(cmd)}")
     proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", timeout=600)
@@ -468,6 +628,9 @@ def onebot_handler():
     if not message_text:
         return jsonify({"ok": True})
 
+    # 保存聊天记录（分群/私聊文件）
+    log_chat(event, message_text)
+
     msg = message_text.strip()
     # 去除开头的 @mention
     msg = _AT_RE.sub('', msg).strip()
@@ -502,18 +665,19 @@ def onebot_handler():
             "📖 JMComic Bot 指令帮助\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
             "🔍 /search <ID|关键词> [排序] [数量]\n"
+            "  /search <关键词> sort=排序 top=数量 page=页码\n"
             "  查询本子信息。纯数字按ID精确查询，文字按关键词搜索。\n"
             "  排序: 收藏/最新/观看/长度 (默认: 收藏)\n"
-            "  数量: 1-50 (默认: 20)\n"
+            "  数量: 旧格式 1-50 (默认20), 新格式 1-80\n"
             "  示例:\n"
-            "    /search 350234        → ID精确查询\n"
-            "    /search 无修正          → 收藏排序，前20条\n"
-            "    /search 无修正 最新 5   → 发布时间排序，前5条\n"
-            "    /search 无修正 观看 10  → 观看数排序，前10条\n\n"
-            "📥 /download <ID>\n"
-            "  下载指定本子并生成 PDF 文件。\n"
+            "    /search 350234              → ID精确查询\n"
+            "    /search 无修正 最新 5        → 发布时间排序，前5条\n"
+            "    /search 原神 sort=观看 top=10 page=2 → 第2页，观看排序\n\n"
+            "📥 /download <ID> [-s|nosend]\n"
+            "  下载指定本子并生成 PDF 文件。加 -s/nosend 仅存储不发送。\n"
             "  示例:\n"
-            "    /download 350234\n\n"
+            "    /download 350234\n"
+            "    /download 350234 -s     → 仅存储，不发送文件\n\n"
             "🌐 /jmurl\n"
             "  获取禁漫网页版和永久入口地址（防和谐格式）\n\n"
             "💓 /ping\n"
@@ -530,11 +694,11 @@ def onebot_handler():
     log(f"/search match: {bool(search_match)}")
     if search_match:
         raw_query = search_match.group(1).strip()
-        query, sort, top_n = parse_search_args(raw_query)
-        log_usage(event.get("user_id"), event.get("group_id"), "search", f"query={query!r} sort={sort} top={top_n}")
-        log(f"received command: /search query={query!r} sort={sort} top={top_n} from user={event.get('user_id')}")
+        query, sort, top_n, page = parse_search_args(raw_query)
+        log_usage(event.get("user_id"), event.get("group_id"), "search", f"query={query!r} sort={sort} top={top_n} page={page}")
+        log(f"received command: /search query={query!r} sort={sort} top={top_n} page={page} from user={event.get('user_id')}")
         try:
-            result_text = run_search(query, sort=sort, top_n=top_n)
+            result_text = run_search(query, sort=sort, top_n=top_n, page=page)
             # 记录搜索结果中的本子
             log_album_from_search(result_text, source="search")
             reply_to_event(event, result_text)
@@ -543,24 +707,28 @@ def onebot_handler():
             reply_to_event(event, f"搜索失败：{e}")
         return jsonify({"ok": True})
 
-    # /download <album_id>
+    # /download <album_id> [-s|nosend]
     dl_match = COMMAND_DL_RE.search(msg)
     log(f"/download match: {bool(dl_match)}")
     if dl_match:
         album_id = dl_match.group(1)
-        log_usage(event.get("user_id"), event.get("group_id"), "download", f"id={album_id}")
-        log(f"received command: /download {album_id} from user={event.get('user_id')}")
+        nosend = bool(COMMAND_DL_NOSEND_RE.search(msg))
+        log_usage(event.get("user_id"), event.get("group_id"), "download", f"id={album_id}" + (" nosend" if nosend else ""))
+        log(f"received command: /download {album_id} nosend={nosend} from user={event.get('user_id')}")
 
         try:
             with lock:
                 result_text, pdf_path = run_download(album_id)
-            # 记录下载的本子
+            # 记录已下载
             if pdf_path and pdf_path.is_file():
-                # 从文件名提取标题: "[JM123456]标题.pdf"
+                _mark_downloaded(album_id)
                 m = re.match(r'\[JM\d+\](.+)\.pdf', pdf_path.name)
                 title = m.group(1).strip() if m else pdf_path.stem
                 log_album(album_id, title, source="download")
-            reply_to_event(event, result_text, file_path=pdf_path)
+            if nosend:
+                reply_to_event(event, f"✅ 下载完成（未发送）: JM{album_id}")
+            else:
+                reply_to_event(event, result_text, file_path=pdf_path)
         except Exception as e:
             log(f"error: {e}")
             reply_to_event(event, f"处理失败：{e}")
@@ -574,6 +742,7 @@ def onebot_handler():
 if __name__ == "__main__":
     import sys
     print("[bot] Starting...", flush=True)
+    start_background_downloader()
     try:
         app.run(host="0.0.0.0", port=int(os.getenv("PORT", "9001")), debug=False)
     except Exception as e:
