@@ -573,6 +573,7 @@ def reply_to_event(
     event: dict[str, Any],
     text: str,
     file_path: Path | None = None,
+    keyboard: dict | None = None,
 ) -> None:
     message_type = event.get("message_type")
 
@@ -590,20 +591,20 @@ def reply_to_event(
         reply_text = f"{text}"
         if file_err:
             reply_text += f"\n⚠️ 文件发送失败: {file_err}"
-    reply_text += RECALL_NOTICE
+    if not keyboard:
+        reply_text += RECALL_NOTICE
 
     # Step 3: Send text message and schedule recall
     try:
+        payload: dict = {"message": reply_text}
+        if keyboard:
+            payload["keyboard"] = keyboard
         if message_type == "private":
-            resp = send_onebot_api("send_private_msg", {
-                "user_id": event.get("user_id"),
-                "message": reply_text,
-            })
+            payload["user_id"] = event.get("user_id")
+            resp = send_onebot_api("send_private_msg", payload)
         elif message_type == "group":
-            resp = send_onebot_api("send_group_msg", {
-                "group_id": event.get("group_id"),
-                "message": reply_text,
-            })
+            payload["group_id"] = event.get("group_id")
+            resp = send_onebot_api("send_group_msg", payload)
         else:
             log(f"unsupported message_type={message_type}")
             return
@@ -879,26 +880,50 @@ for i, (aid, title) in enumerate(page):
         log("help requested, replying...")
         log_usage(event.get("user_id"), event.get("group_id"), "help")
         help_text = (
-            "📖 JMComic Bot 指令帮助\n"
+            "📖 JMComic Bot 完整指令帮助\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            "🔍 /search <ID|关键词> [参数...]\n"
-            "  查询本子。sort=排序 top=数量 page=页码 type=类型\n"
-            "  排序: 收藏/最新/观看/长度 类型: author/tag\n"
-            "  示例: /search 原神 sort=观看 top=10 page=2\n\n"
-            "📥 /download <ID> [ID...] [-s]\n"
-            "  下载并发送 PDF。加 -s 仅存储。支持多 ID\n"
-            "  示例: /download 350234、/download 350234 350235 -s\n\n"
-            "📊 /stats → Bot 统计\n"
-            "🔝 /top [日榜|周榜|月榜] → 排行榜\n"
-            "ℹ️ /info <ID> → 精简详情\n"
-            "🕐 /recent → 最近查询记录\n"
-            "🎲 /random → 随机推荐\n"
-            "⭐ /fav add|list|remove [ID] → 收藏\n"
-            "🌐 /jmurl → 禁漫地址\n"
-            "💓 /ping → 存活检测\n"
-            "❓ /help → 本帮助\n\n"
-            "⏰ 所有消息将在发送后1分50秒自动撤回\n"
-            "💡 聊天中提及 JM车号 会自动识别"
+            "🔍 /search — 搜索本子\n"
+            "  /search <ID>                → 按车号查询详情\n"
+            "  /search <关键词> [排序] [数量] → 旧格式\n"
+            "  /search <关键词> sort=排序 top=数量 page=页码 type=类型 → 新格式\n"
+            "  排序: 收藏/最新/观看/长度 (默认收藏)\n"
+            "  类型: normal/author/tag\n"
+            "  示例:\n"
+            "    /search 350234\n"
+            "    /search 原神 最新 10\n"
+            "    /search 原神 sort=观看 top=10 page=2\n"
+            "    /search MANA type=author top=5\n\n"
+            "📥 /download — 下载本子\n"
+            "  /download <ID> [ID...] [-s]\n"
+            "  支持多ID批量下载，-s 仅存储不发送\n"
+            "  示例:\n"
+            "    /download 350234\n"
+            "    /download 350234 350235 350236 -s\n\n"
+            "📊 /stats — Bot 统计（已下载/待下载/磁盘）\n\n"
+            "🔝 /top — 排行榜\n"
+            "  /top 日榜  |  /top 周榜  |  /top 月榜\n\n"
+            "ℹ️ /info <ID> — 精简本子信息\n"
+            "  示例: /info 350234\n\n"
+            "🖼️ /cover <ID> — 查看封面图片\n"
+            "  示例: /cover 350234\n\n"
+            "🕐 /recent — 最近查询过的本子（最近10个）\n\n"
+            "🎲 /random — 随机推荐一个本子\n\n"
+            "⭐ /fav — 收藏管理\n"
+            "  /fav add 350234    → 添加收藏\n"
+            "  /fav list          → 查看收藏\n"
+            "  /fav remove 350234 → 取消收藏\n\n"
+            "⭐ /rating <ID> <1-10> — 评分\n"
+            "  示例: /rating 350234 8\n\n"
+            "⚙️ /prefs — 搜索偏好\n"
+            "  /prefs                    → 查看偏好\n"
+            "  /prefs set sort=最新 top=10 → 设置偏好\n"
+            "  (设置后 /search 自动应用)\n\n"
+            "🖥️ /sysinfo — 系统信息（CPU/内存/磁盘）\n\n"
+            "🌐 /jmurl — 禁漫地址（防和谐）\n"
+            "💓 /ping — 存活检测\n"
+            "❓ /help — 本帮助\n\n"
+            "⏰ 消息1分50秒后自动撤回\n"
+            "💡 聊天中提及 JM车号 自动识别查询"
         )
         reply_to_event(event, help_text)
         return jsonify({"ok": True})
@@ -928,7 +953,20 @@ for i, (aid, title) in enumerate(page):
             result_text = run_search(query, sort=sort, top_n=top_n, page=page, search_type=search_type)
             # 记录搜索结果中的本子
             log_album_from_search(result_text, source="search")
-            reply_to_event(event, result_text)
+            # 构造内联按钮（仅关键词搜索时显示）
+            kb = None
+            if search_type is None and not re.fullmatch(r'\d+', query):
+                ids = re.findall(r'JM(\d{6,})', result_text)
+                nav_buttons = []
+                if page > 1:
+                    nav_buttons.append({"text": "⬅ 上一页", "action": {"type": 2, "label": "上一页", "data": f"/search {query} page={page-1} top={top_n}" + (f" sort={sort}" if sort else ""), "enter": False}})
+                nav_buttons.append({"text": "下一页 ➡", "action": {"type": 2, "label": "下一页", "data": f"/search {query} page={page+1} top={top_n}" + (f" sort={sort}" if sort else ""), "enter": False}})
+                rows = [{"buttons": nav_buttons}]
+                if ids:
+                    dl_ids = " ".join(ids[:3])
+                    rows.append({"buttons": [{"text": f"📥 下载前{min(3,len(ids))}个", "action": {"type": 2, "label": "下载", "data": f"/download {dl_ids}", "enter": False}}]})
+                kb = {"rows": rows}
+            reply_to_event(event, result_text, keyboard=kb)
         except Exception as e:
             log(f"search error: {e}")
             reply_to_event(event, f"搜索失败：{e}")
