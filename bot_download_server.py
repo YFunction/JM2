@@ -114,6 +114,9 @@ _SUBPROCESS_RETRIES = 3
 # 优先下载队列（/download 指令插入队首）
 _priority_queue: list = []
 _priority_lock = threading.Lock()
+# 当前正在下载的车号（用于 /queue 进度显示）
+_current_download = ""
+_current_download_lock = threading.Lock()
 # 频率限制：窗口(秒) / 最大请求数
 _RATE_LIMIT_WINDOW = 10
 _RATE_LIMIT_MAX = 5
@@ -292,6 +295,8 @@ def _background_downloader() -> None:
             if album_id:
                 if album_id not in _load_downloaded_ids():
                     log(f"background: priority download JM{album_id}")
+                    with _current_download_lock:
+                        _current_download = album_id
                     try:
                         with lock:
                             result_text, pdf_path = run_download(album_id, keep_existing=True)
@@ -300,6 +305,9 @@ def _background_downloader() -> None:
                             log(f"background: JM{album_id} done")
                     except Exception as e:
                         log(f"background: JM{album_id} failed: {e}")
+                    finally:
+                        with _current_download_lock:
+                            _current_download = ""
                 time.sleep(3)
                 continue
 
@@ -315,6 +323,8 @@ def _background_downloader() -> None:
                     if album_id in _load_downloaded_ids():
                         continue
                     log(f"background: downloading JM{album_id}")
+                    with _current_download_lock:
+                        _current_download = album_id
                     try:
                         with lock:
                             result_text, pdf_path = run_download(album_id, keep_existing=True)
@@ -325,6 +335,9 @@ def _background_downloader() -> None:
                             log(f"background: JM{album_id} no pdf generated")
                     except Exception as e:
                         log(f"background: JM{album_id} failed: {e}")
+                    finally:
+                        with _current_download_lock:
+                            _current_download = ""
                     time.sleep(_BG_DOWNLOAD_INTERVAL)
             else:
                 log("background: no pending albums, sleeping 30s")
@@ -729,6 +742,25 @@ def reply_to_event(
         log(f"text reply failed: {e}")
 
 
+def _get_album_page_count(album_id: str) -> int:
+    """获取本子总页数（用于进度显示），失败返回0。"""
+    try:
+        cmd = [PYTHON_EXE, "-c", f"""
+import sys
+sys.stdout = open('/dev/null', 'w')
+from jmcomic import JmOption
+o = JmOption.default()
+c = o.build_jm_client()
+album = c.get_album_detail('{album_id}')
+sys.stdout = sys.__stdout__
+print(album.page_count)
+"""]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return int(proc.stdout.strip()) if proc.stdout.strip().isdigit() else 0
+    except Exception:
+        return 0
+
+
 def find_latest_pdf(dir_path: Path) -> Path | None:
     if not dir_path.exists():
         return None
@@ -781,21 +813,26 @@ def run_search(query: str, sort: str = None, top_n: int = None, page: int = None
     return result or "(查询返回空)"
 
 
-def run_download(album_id: str, keep_existing: bool = False) -> tuple[str, Path | None]:
+def run_download(album_id: str, keep_existing: bool = False, output_subdir: str = "") -> tuple[str, Path | None]:
     # 安全检查：album_id 必须是纯数字
     if not re.fullmatch(r'\d{6,}', album_id):
         return "❌ 无效的本子 ID", None
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # 优先下载使用独立目录，避免与后台下载冲突
+    if output_subdir:
+        out_dir = OUTPUT_DIR / output_subdir
+    else:
+        out_dir = OUTPUT_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
     # 删除旧的 PDF 文件，避免 find_latest_pdf 返回过期结果
     # keep_existing=True 时跳过清理（用于后台批量下载）
     if not keep_existing:
-        for old_pdf in OUTPUT_DIR.glob("*.pdf"):
+        for old_pdf in out_dir.glob("*.pdf"):
             try:
                 old_pdf.unlink()
                 log(f"cleaned old pdf: {old_pdf.name}")
             except Exception as e:
                 log(f"failed to clean old pdf {old_pdf.name}: {e}")
-    cmd = [PYTHON_EXE, str(SCRIPT_PATH), album_id, "-o", str(OUTPUT_DIR)]
+    cmd = [PYTHON_EXE, str(SCRIPT_PATH), album_id, "-o", str(out_dir)]
     log(f"running: {' '.join(cmd)}")
     proc = _run_subprocess_with_retry(cmd, timeout=600)
     stdout = proc.stdout or ""
@@ -805,8 +842,13 @@ def run_download(album_id: str, keep_existing: bool = False) -> tuple[str, Path 
     if proc.returncode != 0:
         return f"下载失败\n{log_output[-1500:]}", None
 
-    pdf = find_latest_pdf(OUTPUT_DIR)
+    pdf = find_latest_pdf(out_dir)
     if pdf is not None:
+        # 如果用了子目录，把 PDF 移到主目录
+        if output_subdir and pdf.parent != OUTPUT_DIR:
+            dest = OUTPUT_DIR / pdf.name
+            pdf.rename(dest)
+            pdf = dest
         return f"下载完成：{pdf.name}", pdf
     return "下载完成，但未找到 PDF 文件。", None
 
@@ -1115,13 +1157,29 @@ for i, (aid, title) in enumerate(page):
                     _priority_queue.insert(0, aid)
         count = len(album_ids)
         reply_to_event(event, f"⏳ 优先下载 {count} 个本子（{', '.join(album_ids)}）...")
-        # 异步下载（不等待优先队列，直接启动）
+        # 异步下载（独立目录，无需等锁，立刻开始）
         def _async_dl():
             results = []
             for aid in album_ids:
                 try:
-                    with lock:
-                        rt, pdf_path = run_download(aid)
+                    with _current_download_lock:
+                        _current_download = aid
+                    # 获取总页数用于进度
+                    total_pages = _get_album_page_count(aid)
+                    # 独立目录，不与后台下载冲突
+                    subdir = f"priority_{aid}"
+                    # 启动进度监控线程
+                    progress_info = {"done": 0, "total": total_pages}
+                    def _monitor_progress():
+                        out_dir = OUTPUT_DIR / subdir
+                        while progress_info["done"] < progress_info["total"]:
+                            time.sleep(2)
+                            count = len(list(out_dir.glob("*"))) if out_dir.exists() else 0
+                            progress_info["done"] = min(count, progress_info["total"])
+                    if total_pages > 0:
+                        threading.Thread(target=_monitor_progress, daemon=True).start()
+                    # 下载（独立目录无需锁，立刻并行）
+                    rt, pdf_path = run_download(aid, output_subdir=subdir)
                     if pdf_path and pdf_path.is_file():
                         _mark_downloaded(aid)
                         m = re.match(r'\[JM\d+\](.+)\.pdf', pdf_path.name)
@@ -1131,14 +1189,20 @@ for i, (aid, title) in enumerate(page):
                     with _priority_lock:
                         if aid in _priority_queue:
                             _priority_queue.remove(aid)
+                    # 进度
+                    pct = f" ({progress_info['done']}/{total_pages}页)" if total_pages > 0 else ""
                     if nosend:
-                        results.append(f"✅ JM{aid}")
+                        results.append(f"✅ JM{aid}{pct}")
                     else:
                         results.append(rt)
                         if pdf_path and pdf_path.is_file():
                             send_file_to_target(event, pdf_path)
                 except Exception as e:
                     results.append(f"❌ JM{aid}: {e}")
+                finally:
+                    with _current_download_lock:
+                        if _current_download == aid:
+                            _current_download = ""
             reply_to_event(event, "\n".join(results))
         threading.Thread(target=_async_dl, daemon=True).start()
         return jsonify({"ok": True})
@@ -1253,20 +1317,45 @@ print(f"JM{{album[0]}}  {{album[1]}}")
             reply_to_event(event, f"❌ {e}")
         return jsonify({"ok": True})
 
-    # /queue - 查看下载队列（优先队列在前）
+    # /queue - 查看下载队列（优先队列在前，含进度）
     if COMMAND_QUEUE_RE.search(msg):
         log("queue requested")
         log_usage(event.get("user_id"), event.get("group_id"), "queue")
+        downloaded = _load_downloaded_ids()
         pending = _get_pending_albums()
         with _priority_lock:
             pri = list(_priority_queue)
+        with _current_download_lock:
+            cur = _current_download
+
+        def _status(aid):
+            if aid in downloaded:
+                return "✅"
+            if aid == cur:
+                # 尝试获取进度
+                pct = ""
+                try:
+                    import re as _re
+                    subdir = OUTPUT_DIR / f"priority_{aid}"
+                    if subdir.exists():
+                        files = list(subdir.glob("*"))
+                        if files:
+                            latest = max(files, key=lambda f: f.stat().st_mtime)
+                            match = _re.search(r'(\d+)', latest.name)
+                            if match:
+                                pct = f" {match.group(1)}p"
+                            else:
+                                pct = f" {len(files)}f"
+                except Exception:
+                    pass
+                return f"⏳{pct}"
+            return "⏸"
+
         lines = []
-        total = 0
         if pri:
             lines.append("🔴 优先队列（/download 指令）：")
             for i, aid in enumerate(pri[:10], 1):
-                lines.append(f"  {i:2d}. JM{aid}")
-                total += 1
+                lines.append(f"  {i:2d}. JM{aid} {_status(aid)}")
             if len(pri) > 10:
                 lines.append(f"  ... 还有 {len(pri) - 10} 个")
         if pending:
@@ -1276,14 +1365,14 @@ print(f"JM{{album[0]}}  {{album[1]}}")
                     lines.append("")
                 lines.append(f"⚪ 静默队列（共 {len(pending)} 个）：")
                 for i, aid in enumerate(pending[:20 - len(pri)], len(pri) + 1):
-                    lines.append(f"  {i:2d}. JM{aid}")
-                    total += 1
+                    lines.append(f"  {i:2d}. JM{aid} {_status(aid)}")
                 if len(pending) > 20 - len(pri):
                     lines.append(f"  ... 还有 {len(pending) - (20 - len(pri))} 个")
         if not lines:
             text = "📥 下载队列为空"
         else:
-            text = "📥 下载队列\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines)
+            legend = "\n✅已下载 ⏳下载中 ⏸排队  数字=已下载页数"
+            text = "📥 下载队列\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines) + legend
         reply_to_event(event, text)
         return jsonify({"ok": True})
 
