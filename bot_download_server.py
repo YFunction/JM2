@@ -808,6 +808,7 @@ class DownloadTask:
     is_priority: bool = False
     cancel_event: threading.Event = field(default_factory=threading.Event)
     future: Future | None = None
+    event_info: dict | None = None  # 用于发送文件给用户
 
 class SyncDownloader:
     """线程池下载调度器：优先任务抢占 + 静默任务可取消。"""
@@ -820,13 +821,13 @@ class SyncDownloader:
         self._scheduler_running = True
         threading.Thread(target=self._scheduler, daemon=True, name="dl-scheduler").start()
 
-    def submit_priority(self, album_ids: list[str]) -> int:
+    def submit_priority(self, album_ids: list[str], event_info: dict | None = None) -> int:
         """优先下载：插入队首，唤醒调度器。"""
         count = 0
         with self._lock:
             for aid in reversed(album_ids):
                 if aid not in self.active and not any(t.album_id == aid for t in self.priority_queue):
-                    task = DownloadTask(album_id=aid, is_priority=True)
+                    task = DownloadTask(album_id=aid, is_priority=True, event_info=event_info)
                     self.priority_queue.insert(0, task)
                     count += 1
         return count
@@ -888,6 +889,13 @@ class SyncDownloader:
                 title = m.group(1).strip() if m else pdf_path.stem
                 log_album(task.album_id, title, source="download")
             log(f"{'PRI' if task.is_priority else 'BG'} done: JM{task.album_id} -> {result_text[:80]}")
+            # 优先任务下载完成后发送给用户
+            if task.is_priority and task.event_info and pdf_path and pdf_path.is_file():
+                try:
+                    send_file_to_target(task.event_info, pdf_path)
+                    reply_to_event(task.event_info, f"✅ JM{task.album_id} {result_text[:60]}")
+                except Exception as e:
+                    log(f"send file failed for JM{task.album_id}: {e}")
         except Exception as e:
             log(f"download worker error JM{task.album_id}: {e}")
         finally:
@@ -1098,13 +1106,27 @@ def onebot_handler():
         total_size = sum(p.stat().st_size for p in OUTPUT_DIR.glob("[JM*]*.pdf"))
         size_str = f"{total_size/1024/1024:.0f}MB" if total_size else "0MB"
         pending = len(_get_pending_albums())
+        # 活跃下载
+        status = _downloader.get_status()
+        active = status["active"]
+        active_lines = ""
+        if active:
+            active_lines = "\n\n🔄 线程池（5槽位）下载中：\n"
+            for i, (aid, is_pri) in enumerate(active, 1):
+                tag = "🔴" if is_pri else "⚪"
+                active_lines += f"  槽{i}. {tag} JM{aid}\n"
+            # 空闲槽位
+            for i in range(len(active) + 1, _MAX_DOWNLOAD_WORKERS + 1):
+                active_lines += f"  槽{i}. 💤 空闲\n"
+        else:
+            active_lines = "\n\n🔄 线程池：💤 全部空闲"
         stats_text = (
             "📊 Bot 统计\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
-            f"📥 已下载: {downloaded} 个本子\n"
+            f"📥 已下载: {downloaded} 个\n"
             f"📄 PDF 文件: {pdf_count} 个（{size_str}）\n"
-            f"⏳ 待下载: {pending} 个\n"
-            f"💾 磁盘: {size_str}"
+            f"⏳ 待下载: {pending} 个"
+            + active_lines
         )
         reply_to_event(event, stats_text)
         return jsonify({"ok": True})
@@ -1262,7 +1284,7 @@ for i, (aid, title) in enumerate(page):
         nosend = bool(COMMAND_DL_NOSEND_RE.search(msg))
         log_usage(event.get("user_id"), event.get("group_id"), "download", f"ids={album_ids}" + (" nosend" if nosend else ""))
         log(f"received command: /download {album_ids} nosend={nosend}")
-        count = _downloader.submit_priority(album_ids)
+        count = _downloader.submit_priority(album_ids, event_info=event)
         reply_to_event(event, f"⏳ 优先下载 {count} 个本子（{', '.join(album_ids[:10])}）...")
         return jsonify({"ok": True})
 
