@@ -111,6 +111,9 @@ _DOWNLOADED_LOG = _LOG_DIR / "downloaded.txt"
 _BG_DOWNLOAD_INTERVAL = 15
 # 子进程重试次数
 _SUBPROCESS_RETRIES = 3
+# 优先下载队列（/download 指令插入队首）
+_priority_queue: list = []
+_priority_lock = threading.Lock()
 # 频率限制：窗口(秒) / 最大请求数
 _RATE_LIMIT_WINDOW = 10
 _RATE_LIMIT_MAX = 5
@@ -135,6 +138,7 @@ COMMAND_RECENT_RE = re.compile(r"/recent", re.IGNORECASE)
 COMMAND_RANDOM_RE = re.compile(r"/random", re.IGNORECASE)
 COMMAND_FAV_RE = re.compile(r"/fav\s*(add|list|remove|del)?\s*(\d{6,})?", re.IGNORECASE)
 COMMAND_SYSINFO_RE = re.compile(r"/sysinfo", re.IGNORECASE)
+COMMAND_QUEUE_RE = re.compile(r"/queue", re.IGNORECASE)
 COMMAND_PREFS_RE = re.compile(r"/prefs(?:\s+set\s+sort=(\S+))?(?:\s+top=(\d+))?", re.IGNORECASE)
 COMMAND_COVER_RE = re.compile(r"/cover\s+(\d{6,})", re.IGNORECASE)
 COMMAND_RATING_RE = re.compile(r"/rating\s+(\d{6,})\s+(\d|10)", re.IGNORECASE)
@@ -275,15 +279,39 @@ def _get_pending_albums() -> list[str]:
 
 
 def _background_downloader() -> None:
-    """后台线程：静默下载 albums.log 中未下载过的本子。"""
+    """后台线程：静默下载 albums.log 中未下载过的本子，优先处理用户 /download 请求。"""
     log("background downloader started")
     while True:
         try:
+            # ── 优先处理用户请求 ──
+            with _priority_lock:
+                if _priority_queue:
+                    album_id = _priority_queue.pop(0)
+                else:
+                    album_id = None
+            if album_id:
+                if album_id not in _load_downloaded_ids():
+                    log(f"background: priority download JM{album_id}")
+                    try:
+                        with lock:
+                            result_text, pdf_path = run_download(album_id, keep_existing=True)
+                        if pdf_path and pdf_path.is_file():
+                            _mark_downloaded(album_id)
+                            log(f"background: JM{album_id} done")
+                    except Exception as e:
+                        log(f"background: JM{album_id} failed: {e}")
+                time.sleep(3)
+                continue
+
+            # ── 常规静默下载 ──
             pending = _get_pending_albums()
             if pending:
                 log(f"background: {len(pending)} pending albums to download")
                 for album_id in pending:
-                    # 再次检查（可能被用户抢先下载了）
+                    # 检查是否有优先任务插入
+                    with _priority_lock:
+                        if _priority_queue:
+                            break  # 跳出循环，优先处理用户请求
                     if album_id in _load_downloaded_ids():
                         continue
                     log(f"background: downloading JM{album_id}")
@@ -297,7 +325,6 @@ def _background_downloader() -> None:
                             log(f"background: JM{album_id} no pdf generated")
                     except Exception as e:
                         log(f"background: JM{album_id} failed: {e}")
-                    # 限速间隔
                     time.sleep(_BG_DOWNLOAD_INTERVAL)
             else:
                 log("background: no pending albums, sleeping 30s")
@@ -869,7 +896,7 @@ def onebot_handler():
     
     if is_slash_cmd:
         # 频率限制检查（仅对命令生效）
-        is_command = any(r.search(msg) for r in [COMMAND_PING_RE, COMMAND_JMURL_RE, COMMAND_HELP_RE, COMMAND_SE_RE, COMMAND_DL_RE, COMMAND_STATS_RE, COMMAND_TOP_RE, COMMAND_INFO_RE, COMMAND_RECENT_RE, COMMAND_RANDOM_RE, COMMAND_FAV_RE, COMMAND_SYSINFO_RE, COMMAND_PREFS_RE, COMMAND_COVER_RE, COMMAND_RATING_RE])
+        is_command = any(r.search(msg) for r in [COMMAND_PING_RE, COMMAND_JMURL_RE, COMMAND_HELP_RE, COMMAND_SE_RE, COMMAND_DL_RE, COMMAND_STATS_RE, COMMAND_TOP_RE, COMMAND_INFO_RE, COMMAND_RECENT_RE, COMMAND_RANDOM_RE, COMMAND_FAV_RE, COMMAND_SYSINFO_RE, COMMAND_QUEUE_RE, COMMAND_PREFS_RE, COMMAND_COVER_RE, COMMAND_RATING_RE])
         if is_command and not _check_rate_limit(user_id, group_id):
             log(f"rate limited: user={user_id} group={group_id}")
             return jsonify({"ok": False, "error": "rate limited"}), 429
@@ -1081,10 +1108,14 @@ for i, (aid, title) in enumerate(page):
         nosend = bool(COMMAND_DL_NOSEND_RE.search(msg))
         log_usage(event.get("user_id"), event.get("group_id"), "download", f"ids={album_ids}" + (" nosend" if nosend else ""))
         log(f"received command: /download {album_ids} nosend={nosend}")
-        # 立即回复 "开始下载"
+        # 插入优先队列队首
+        with _priority_lock:
+            for aid in reversed(album_ids):
+                if aid not in _priority_queue:
+                    _priority_queue.insert(0, aid)
         count = len(album_ids)
-        reply_to_event(event, f"⏳ 开始下载 {count} 个本子（{', '.join(album_ids)}）...")
-        # 异步下载
+        reply_to_event(event, f"⏳ 优先下载 {count} 个本子（{', '.join(album_ids)}）...")
+        # 异步下载（不等待优先队列，直接启动）
         def _async_dl():
             results = []
             for aid in album_ids:
@@ -1096,6 +1127,10 @@ for i, (aid, title) in enumerate(page):
                         m = re.match(r'\[JM\d+\](.+)\.pdf', pdf_path.name)
                         title = m.group(1).strip() if m else pdf_path.stem
                         log_album(aid, title, source="download")
+                    # 从优先队列移除
+                    with _priority_lock:
+                        if aid in _priority_queue:
+                            _priority_queue.remove(aid)
                     if nosend:
                         results.append(f"✅ JM{aid}")
                     else:
@@ -1216,6 +1251,40 @@ print(f"JM{{album[0]}}  {{album[1]}}")
             reply_to_event(event, "❌ 缺少 psutil 模块")
         except Exception as e:
             reply_to_event(event, f"❌ {e}")
+        return jsonify({"ok": True})
+
+    # /queue - 查看下载队列（优先队列在前）
+    if COMMAND_QUEUE_RE.search(msg):
+        log("queue requested")
+        log_usage(event.get("user_id"), event.get("group_id"), "queue")
+        pending = _get_pending_albums()
+        with _priority_lock:
+            pri = list(_priority_queue)
+        lines = []
+        total = 0
+        if pri:
+            lines.append("🔴 优先队列（/download 指令）：")
+            for i, aid in enumerate(pri[:10], 1):
+                lines.append(f"  {i:2d}. JM{aid}")
+                total += 1
+            if len(pri) > 10:
+                lines.append(f"  ... 还有 {len(pri) - 10} 个")
+        if pending:
+            pending = [a for a in pending if a not in pri]
+            if pending:
+                if lines:
+                    lines.append("")
+                lines.append(f"⚪ 静默队列（共 {len(pending)} 个）：")
+                for i, aid in enumerate(pending[:20 - len(pri)], len(pri) + 1):
+                    lines.append(f"  {i:2d}. JM{aid}")
+                    total += 1
+                if len(pending) > 20 - len(pri):
+                    lines.append(f"  ... 还有 {len(pending) - (20 - len(pri))} 个")
+        if not lines:
+            text = "📥 下载队列为空"
+        else:
+            text = "📥 下载队列\n━━━━━━━━━━━━━━━━━━\n" + "\n".join(lines)
+        reply_to_event(event, text)
         return jsonify({"ok": True})
 
     # /prefs [set sort=xxx top=xx]
