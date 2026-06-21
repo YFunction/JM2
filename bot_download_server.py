@@ -282,33 +282,15 @@ def _get_pending_albums() -> list[str]:
 
 
 def _background_downloader() -> None:
-    """后台线程：静默下载 albums.log 中未下载过的本子，优先处理用户 /download 请求。"""
+    """后台线程：静默下载 albums.log 中未下载过的本子，优先队列有内容时暂停。"""
     log("background downloader started")
     while True:
         try:
-            # ── 优先处理用户请求 ──
+            # ── 优先队列有任务时，暂停后台下载 ──
             with _priority_lock:
-                if _priority_queue:
-                    album_id = _priority_queue.pop(0)
-                else:
-                    album_id = None
-            if album_id:
-                if album_id not in _load_downloaded_ids():
-                    log(f"background: priority download JM{album_id}")
-                    with _current_download_lock:
-                        _current_download = album_id
-                    try:
-                        with lock:
-                            result_text, pdf_path = run_download(album_id, keep_existing=True)
-                        if pdf_path and pdf_path.is_file():
-                            _mark_downloaded(album_id)
-                            log(f"background: JM{album_id} done")
-                    except Exception as e:
-                        log(f"background: JM{album_id} failed: {e}")
-                    finally:
-                        with _current_download_lock:
-                            _current_download = ""
-                time.sleep(3)
+                has_priority = bool(_priority_queue)
+            if has_priority:
+                time.sleep(5)
                 continue
 
             # ── 常规静默下载 ──
@@ -316,10 +298,11 @@ def _background_downloader() -> None:
             if pending:
                 log(f"background: {len(pending)} pending albums to download")
                 for album_id in pending:
-                    # 检查是否有优先任务插入
+                    # 每个本子下载前检查优先队列
                     with _priority_lock:
                         if _priority_queue:
-                            break  # 跳出循环，优先处理用户请求
+                            log("background: paused for priority queue")
+                            break
                     if album_id in _load_downloaded_ids():
                         continue
                     log(f"background: downloading JM{album_id}")
