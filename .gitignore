@@ -172,3 +172,25 @@ gemini.md
 downloads/
 # Bot runtime logs (contain user QQ numbers)
 logs/
+# Runtime temp logs
+/tmp/*.log
+# NapCat runtime databases
+*.db
+*.db-shm
+*.db-wal
+# Environment config (contains secrets)
+.env
+.env.*
+# Bot config with QQ numbers
+onebot11_*.json
+napcat_*.json
+# JMBot scripts that may contain QQ numbers (keep templates only)
+!start_silent.sh
+!stop_silent.sh
+# Dashboard runtime
+dashboard.log
+# Packaging artifacts
+dist/
+release/
+*.tar.gz
+*.zip

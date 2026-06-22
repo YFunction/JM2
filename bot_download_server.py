@@ -849,11 +849,12 @@ class SyncDownloader:
 
         cmd = [PYTHON_EXE, str(SCRIPT_PATH), album_id, "-o", str(out_dir)]
         log(f"running ({'PRI' if task.is_priority else 'BG'}): {' '.join(cmd)}")
+        deadline = time.time() + (3600 if task.is_priority else 3600)  # 1小时超时
 
         try:
             proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     text=True, encoding="utf-8")
-            # 轮询等待，每2秒检查取消标志
+            # 轮询等待，每2秒检查取消标志和超时
             while proc.poll() is None:
                 if task.cancel_event.is_set():
                     proc.terminate()
@@ -861,8 +862,14 @@ class SyncDownloader:
                     except subprocess.TimeoutExpired: proc.kill()
                     log(f"cancelled: JM{album_id}")
                     return "⏹ 已取消", None
+                if time.time() > deadline:
+                    proc.terminate()
+                    try: proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired: proc.kill()
+                    log(f"timeout: JM{album_id} exceeded deadline")
+                    return "⏰ 下载超时", None
                 time.sleep(2)
-            stdout, stderr = proc.communicate(timeout=5) if proc.returncode is not None else ("", "")
+            stdout, stderr = proc.communicate(timeout=5)
 
         except Exception as e:
             return f"❌ 下载异常: {e}", None
@@ -1094,7 +1101,7 @@ def onebot_handler():
             with _BOT_QQ_LOCK:
                 bot_qq = _BOT_QQ
             if bot_qq:
-                # 方式1: QQ @提及 = [CQ:at,qq=2837430647]
+                # 方式1: QQ @提及 = [CQ:at,qq=<BOT_QQ>]
                 has_cq_at = f"[CQ:at,qq={bot_qq}]" in message_text
                 # 方式2: 手打 @bot / @JMBot（NapCat 会保留纯文本）
                 has_text_at = bool(re.search(r'@(bot|JMBot|jmBot|jm bot)', message_text, re.IGNORECASE))

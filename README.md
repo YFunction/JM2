@@ -10,12 +10,9 @@
 
 > ⚠️ 使用前请务必观看：[2000字！宇宙安全声明合集](https://www.bilibili.com/video/BV1Ts4y1F7r3/)
 
-## 🤖 体验 QQ
+## 🤖 快速体验
 
-| 项目 | 详情 |
-|------|------|
-| 体验 QQ | **2837430647**（JMBot） |
-| 触发方式 | `@JMBot` 或 `/` 指令 |
+在 QQ 群中发送 `/help` 即可查看全部指令。
 
 ## 功能
 
@@ -101,12 +98,37 @@
 - Python >= 3.8
 - NapCat（QQ Bot 框架，基于 QQ Linux）
 
-## 快速开始
+## 快速开始（一键安装）
+
+```bash
+# 1. 克隆仓库
+git clone <your-repo-url> JM2 && cd JM2
+
+# 2. 一键安装（交互式，会询问 QQ 号等配置）
+bash install.sh
+
+# 3. 登录 QQ
+#    访问 NapCat WebUI: http://127.0.0.1:6099/webui
+#    扫码登录你的 Bot QQ 号
+
+# 4. 完成！
+#    监控面板: http://<服务器IP>:9002
+#    在 QQ 群发送 /help 查看指令
+```
+
+安装脚本会自动完成：
+- ✅ 系统依赖安装（Python、xvfb、screen 等）
+- ✅ Python 虚拟环境 + jmcomic + Bot 依赖
+- ✅ NapCat 配置（OneBot HTTP 自动配置）
+- ✅ systemd 服务创建（开机自启）
+- ✅ 监控面板部署
+
+## 手动安装
 
 ### 1. 安装依赖
 
 ```bash
-pip install jmcomic flask requests img2pdf psutil
+pip install jmcomic flask requests img2pdf psutil waitress
 cd JM2 && pip install -e . --no-build-isolation
 ```
 
@@ -142,6 +164,13 @@ BOT_QQ=你的QQ号 ALLOWED_GROUPS=群号1,群号2 \
 ./stop_bot.sh      # 停止
 ```
 
+### 6. 启动监控面板（可选）
+
+```bash
+bash start_dashboard.sh    # 启动面板 (端口 9002)
+bash stop_dashboard.sh     # 停止面板
+```
+
 ## 环境变量
 
 | 环境变量 | 默认值 | 说明 |
@@ -157,20 +186,42 @@ BOT_QQ=你的QQ号 ALLOWED_GROUPS=群号1,群号2 \
 
 ```
 JM2/
-├── bot_download_server.py   # QQ Bot 主程序（~1400 行）
+├── install.sh               # 🔥 一键安装脚本
+├── bot_download_server.py   # QQ Bot 主程序
+├── bot_dashboard.py         # Web 监控面板（端口 9002）
 ├── search_album_info.py     # 搜索脚本
 ├── download_album_to_pdf.py # 下载 + PDF 生成
 ├── napcat.sh                # NapCat 安装脚本
-├── restart_bot.sh           # 紧急重启脚本
-├── stop_bot.sh              # 紧急停止脚本
-├── downloads/               # PDF 下载输出（gitignore）
+├── restart_bot.sh           # 紧急重启
+├── stop_bot.sh              # 紧急停止
+├── start_dashboard.sh       # 启动面板
+├── stop_dashboard.sh        # 停止面板
+├── jm2bot.service           # systemd 服务模板
+├── downloads/               # PDF 输出 (gitignore)
 ├── logs/
 │   ├── usage.log            # 命令使用记录
-│   ├── albums.log           # 本子访问记录（含标题+标签）
+│   ├── albums.log           # 本子访问记录
 │   ├── downloaded.txt       # 已下载 ID
 │   └── chat/                # 聊天记录（分群/私聊）
 ├── src/jmcomic/             # jmcomic 核心库
-└── README.md
+└── .env                     # 安装时自动生成的环境变量
+```
+
+## 发布打包
+
+```bash
+# 创建发布包（排除敏感文件和运行时数据）
+tar -czf jm2-bot-v1.0.tar.gz \
+  --exclude='.git' \
+  --exclude='downloads' \
+  --exclude='logs' \
+  --exclude='.venv' \
+  --exclude='*.pyc' \
+  --exclude='__pycache__' \
+  --exclude='*.egg-info' \
+  --exclude='.env' \
+  --exclude='*.db' \
+  .
 ```
 
 ## 致谢

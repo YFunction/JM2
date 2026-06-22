@@ -4,11 +4,20 @@ import os
 import shutil
 import sys
 
-from jmcomic import download_album, Feature
+from jmcomic import download_album, Feature, JmDownloader, JmOption
 
 
 DEFAULT_ALBUM_ID = 350234
 DEFAULT_OUTPUT_DIR = Path(__file__).resolve().parent / "downloads"
+
+
+class FilterEmptyPhotosDownloader(JmDownloader):
+    """过滤掉 page_arr 为空的章节，避免静默卡死。"""
+    def do_filter(self, detail):
+        if detail.is_photo() and len(detail) == 0:
+            print(f"⏭ 跳过空章节: {detail.photo_id} {detail.name}")
+            return []
+        return detail
 
 
 def cleanup_download_tree(root: Path) -> None:
@@ -59,9 +68,10 @@ def main() -> None:
     old_cwd = os.getcwd()
     try:
         os.chdir(output_dir)
-        album, _ = download_album(
+        album, dler = download_album(
             album_id,
-            extra=Feature.export_pdf,
+            extra=Feature.export_pdf(pdf_dir=str(output_dir)),
+            downloader=FilterEmptyPhotosDownloader,
         )
         cleanup_download_tree(output_dir)
         print(f"下载完成，结果文件将生成在: {output_dir}")
