@@ -112,7 +112,7 @@ _BG_DOWNLOAD_INTERVAL = 15
 # 子进程重试次数
 _SUBPROCESS_RETRIES = 3
 # 最大并行下载数
-_MAX_DOWNLOAD_WORKERS = 5
+_MAX_DOWNLOAD_WORKERS = 1
 # 频率限制：窗口(秒) / 最大请求数
 _RATE_LIMIT_WINDOW = 10
 _RATE_LIMIT_MAX = 5
@@ -1137,15 +1137,11 @@ def onebot_handler():
         active = status["active"]
         active_lines = ""
         if active:
-            active_lines = "\n\n🔄 线程池（5槽位）下载中：\n"
-            for i, (aid, is_pri) in enumerate(active, 1):
-                tag = "🔴" if is_pri else "⚪"
-                active_lines += f"  槽{i}. {tag} JM{aid}\n"
-            # 空闲槽位
-            for i in range(len(active) + 1, _MAX_DOWNLOAD_WORKERS + 1):
-                active_lines += f"  槽{i}. 💤 空闲\n"
+            aid, is_pri = active[0]
+            tag = "🔴优先" if is_pri else "⚪静默"
+            active_lines = f"\n\n🔄 单线程下载中：{tag} JM{aid}\n"
         else:
-            active_lines = "\n\n🔄 线程池：💤 全部空闲"
+            active_lines = "\n\n🔄 单线程：💤 空闲"
         stats_text = (
             "📊 Bot 统计\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
