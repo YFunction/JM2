@@ -1010,6 +1010,32 @@ def diag():
     return jsonify(result)
 
 
+@app.route("/admin/stop-silent", methods=["POST"])
+def admin_stop_silent():
+    """管理端点：取消所有静默下载并清空静默队列。"""
+    with _downloader._lock:
+        # 取消所有活跃的静默任务
+        for aid, t in list(_downloader.active.items()):
+            if not t.is_priority:
+                t.cancel_event.set()
+                log(f"admin: cancelled silent JM{aid}")
+        # 清空静默队列
+        count = len(_downloader.silent_queue)
+        _downloader.silent_queue.clear()
+    log(f"admin: stopped {count} silent tasks")
+    return jsonify({"ok": True, "cancelled_active": sum(1 for _, t in _downloader.active.items() if not t.is_priority),
+                    "cleared_queue": count})
+
+
+@app.route("/admin/start-silent", methods=["POST"])
+def admin_start_silent():
+    """管理端点：重新填充静默队列。"""
+    _downloader.refill_silent()
+    count = len(_downloader.silent_queue)
+    log(f"admin: refilled silent queue, {count} pending")
+    return jsonify({"ok": True, "pending": count})
+
+
 @app.route("/onebot", methods=["POST"])
 def onebot_handler():
     try:
